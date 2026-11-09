@@ -29,11 +29,14 @@ pitnacree <- pitnacree %>%
 
 ### Importing Peaks ###
 ```{r peaks}
+threshold     <- 260  # Peaks over threshold (m3/s), change for initial threshold
+steps_per_day <- 96   # 15-minute data resolution (24 * 4)
+
 # Put Pitnacree on a continuous 15-minute grid
 pit <- tibble(
   Timestamp = seq(
-    min(pitnacree$Timestamp),
-    max(pitnacree$Timestamp),
+    min(pitnacree$Timestamp, na.rm= TRUE),
+    max(pitnacree$Timestamp, na.rm=TRUE),
     by = "15 min"
   )
 ) %>%
@@ -97,7 +100,10 @@ for (k in 2:nrow(cand)) {
 
 peaks_passed <- cand[keep, ]
 n_years <- sum(!is.na(flow)) / (steps_per_day * 365.25)
+```
 
+
+```{r peaks}
 
 ```
 
