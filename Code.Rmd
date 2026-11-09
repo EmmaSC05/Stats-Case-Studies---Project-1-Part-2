@@ -11,16 +11,16 @@ library(tidyverse)
 ```
 
 ```{r import data, include=FALSE}
-# Import Pitnacree flow data directly from ZIP file
+# Import Pitnacree flow data directly from ZIP file in Github
 pitnacree <- read.csv(unz("pitnacree.zip", "pitnacree.csv"))
 ```
 
 
-## Emma C
+### Importing Peaks ###
+```{r peaks}
 
 
-```{r emma c}
-summary(cars)
+
 ```
 
 
