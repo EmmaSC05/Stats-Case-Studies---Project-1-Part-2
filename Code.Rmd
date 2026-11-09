@@ -10,6 +10,51 @@ knitr::opts_chunk$set(echo = TRUE)
 library(tidyverse) 
 ```
 
+```{r}
+# Read timestamps as character initially
+sepa_types <- cols(
+  `#Timestamp`   = col_character(),
+  Value          = col_double(),
+  `Quality Code` = col_double()
+)
+
+
+pitnacree <- list.files(
+  path = "~/UoE/1STATS CASE STUDIES/pitnacree",
+  pattern = "\\.csv$",
+  full.names = TRUE
+) %>%
+  lapply(function(file) read_delim(file, delim = ";", skip = 11,
+                                   col_types = sepa_types,
+                                   show_col_types = FALSE)) %>%
+  bind_rows()
+
+pitnacree <- pitnacree %>%
+  rename(Timestamp = `#Timestamp`) %>%
+  mutate(Timestamp = ymd_hms(Timestamp, tz = "UTC"))
+
+
+timestamp_check <- tibble(
+  River = c("Pitnacree"),
+  Missing_Timestamps = c(
+    sum(is.na(pitnacree$Timestamp))
+  )
+)
+
+####### Checking if duplicates are identical
+print(pitnacree %>%
+        filter(duplicated(Timestamp) | duplicated(Timestamp, fromLast = TRUE)) %>%
+        arrange(Timestamp))
+
+###### Removing Duplicates
+pitnacree <- pitnacree %>% distinct(Timestamp, .keep_all = TRUE)
+
+
+###### Sort Data chronologically
+pitnacree <- pitnacree %>% arrange(Timestamp)
+```
+
+
 ## Emma C
 
 
