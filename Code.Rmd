@@ -7,18 +7,96 @@ output: html_document
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
-library(tidyverse) 
+library(tidyverse)
+library(dplyr)
+library(readr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(patchwork)
+library(pracma)
+library(ismev)
 ```
 
 ```{r import data, include=FALSE}
 # Import Pitnacree flow data directly from ZIP file in Github
 pitnacree <- read.csv(unz("pitnacree.zip", "pitnacree.csv"))
+
+pitnacree <- pitnacree %>%
+  mutate(Timestamp = ymd_hms(Timestamp, tz = "UTC"))
 ```
 
 
 ### Importing Peaks ###
 ```{r peaks}
+# Put Pitnacree on a continuous 15-minute grid
+pit <- tibble(
+  Timestamp = seq(
+    min(pitnacree$Timestamp),
+    max(pitnacree$Timestamp),
+    by = "15 min"
+  )
+) %>%
+  left_join(
+    pitnacree %>% dplyr::select(Timestamp, Value),
+    by = "Timestamp"
+  )
 
+flow <- pit$Value
+flow_noNA <- replace_na(flow, 0) # 0 ensures peak detection ignores missing intervals
+
+
+# Extract candidate peaks exceeding the specified threshold
+raw <- findpeaks(flow_noNA, minpeakheight = threshold, minpeakdistance = 1, zero = "0")
+
+cand <- tibble(
+  max_flow   = raw[, 1],
+  max_time   = raw[, 2],
+  peak_begin = raw[, 3],
+  peak_end   = raw[, 4]
+) %>%
+  arrange(max_time) %>%
+  mutate(ttr = max_time - peak_begin) # Time to rise in 15-min steps
+
+
+# Compute average time to peak from "clean" isolated events
+near_other <- sapply(seq_len(nrow(cand)), function(i) {
+  any(abs(cand$max_time[-i] - cand$max_time[i]) < 7 * steps_per_day)
+})
+
+clean <- cand %>%
+  mutate(clean = flow[peak_begin] < 0.5 * max_flow & !near_other & !is.na(flow[peak_begin]))
+
+avg_ttr <- mean(clean$ttr[clean$clean])
+min_sep <- 3 * avg_ttr
+cat(sprintf("Avg time to peak: %.2f hours | Min FEH separation: %.2f hours\n", avg_ttr / 4, min_sep / 4))
+
+
+# Filter candidate peaks using FEH independence criteria 
+keep <- rep(TRUE, nrow(cand))
+last <- 1
+
+for (k in 2:nrow(cand)) {
+  sep <- cand$max_time[k] - cand$max_time[last]
+  independent <- sep >= min_sep
+  
+  if (independent) {
+    trough <- min(flow[cand$max_time[last]:cand$max_time[k]], na.rm = TRUE)
+    independent <- trough < (2/3) * cand$max_flow[last]
+  }
+  
+  if (independent) {
+    last <- k
+  } else if (cand$max_flow[k] > cand$max_flow[last]) {
+    keep[last] <- FALSE
+    last <- k
+  } else {
+    keep[k] <- FALSE
+  }
+}
+
+peaks_passed <- cand[keep, ]
+n_years <- sum(!is.na(flow)) / (steps_per_day * 365.25)
 
 
 ```
