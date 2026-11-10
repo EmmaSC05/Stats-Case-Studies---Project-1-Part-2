@@ -23,7 +23,11 @@ library(ismev)
 pitnacree <- read.csv(unz("pitnacree.zip", "pitnacree.csv"))
 
 pitnacree <- pitnacree %>%
-  mutate(Timestamp = ymd_hms(Timestamp, tz = "UTC"))
+  mutate(Timestamp = parse_date_time(Timestamp, orders = c("ymd HMS", "ymd HM", "ymd"), tz = "UTC"))
+
+raw <- pitnacree$Timestamp
+ bad <- raw[is.na(ymd_hms(raw, tz = "UTC", quiet = TRUE))]
+ head(bad); length(bad)
 ```
 
 
@@ -111,10 +115,38 @@ n_years <- sum(!is.na(flow)) / (steps_per_day * 365.25)
 ## Emma D
 
 
-```{r emma d}
-summary(cars)
+```{r scale peaks to same grid, normalise}
+K    <- 101                          # grid points per hydrograph
+grid <- seq(0, 1, length.out = K)
+
+resample_event <- function(i) {
+  idx <- peaks_passed$peak_begin[i]:peaks_passed$peak_end[i]
+  x   <- (seq_along(idx) - 1) / (length(idx) - 1)   # time / width, in [0,1]
+  approx(x, pit$Value[idx], xout = grid)$y               # linearly interpolate to grid
+}
+
+H <- sapply(seq_len(nrow(peaks_passed)), resample_event)   # K x n matrix
+width <- peaks_passed$peak_end - peaks_passed$peak_begin   #keep the widths as suggested
+pk    <- peaks_passed$max_flow
+
+H_norm_p    <- sweep(H, 2, pk, "/")                        # try normalising by peak?
+
 ```
 
+
+```{r linear fit}
+deg <- 8 #just for a decent approx, will need to try a few and measure reconstruction error before choosing one
+B   <- poly(grid, deg)               # orthogonal polynomial basis, same for all events
+
+fit   <- lm(H_norm_p ~ B)                  # matrix response with one regression per event
+coefs <- t(coef(fit))                # n x (deg+1): intercept + deg coefficients
+
+#reconstruciton
+Hhat <- cbind(1, B) %*% t(coefs)     # K x n fitted hydrographs
+
+#see approximated hydrograph vs real
+matplot(grid, cbind(H_norm_p[, 6], Hhat[, 6]), type = "l")
+```
 
 
 ## Harry
