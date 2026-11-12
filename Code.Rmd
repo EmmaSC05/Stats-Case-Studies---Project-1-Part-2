@@ -285,4 +285,28 @@ summary(max_flow)
 # Count hydrographs with a maximum more than 5% above 1
 sum(max_flow > 1.05)
 ``` 
+```{r checks3}
+# Identify hydrographs retained for PCA
+valid <- which(!sapply(segs, is.null))
 
+# Find maximum normalised flow for each hydrograph
+max_ratio <- apply(Y, 1, max)
+
+# Find the time of the largest peak in each window
+max_hour <- t_h[max.col(Y, ties.method = "first")]
+
+# Create table of potentially problematic events
+problem_events <- tibble(
+  Event = valid,
+  Date = pit$Timestamp[peaks_passed$max_time[valid]],
+  Selected_peak = peaks_passed$max_flow[valid],
+  Ratio = max_ratio,
+  Hours_to_max = max_hour
+) %>%
+  filter(Ratio > 1.05) %>%
+  arrange(desc(Ratio))
+
+# Display the 27 cases
+print(n=27, head(problem_events, 27))
+
+```
