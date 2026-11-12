@@ -2,7 +2,9 @@
 title: "Our Code"
 author: "Emma Crawford"
 date: "`r Sys.Date()`"
-output: html_document
+output:
+  pdf_document: default
+  html_document: default
 ---
 
 ```{r setup, include=FALSE}
@@ -195,4 +197,92 @@ lines(t_h, recon, col = "red", lwd = 2, lty = 2)
 legend("topright", legend = c("Original", "Recon"), col = c("black", "red"), lty = c(1, 2), lwd = 2)
 ```
 
+
+## Emma C
+
+```{r checks}
+# Check for missing or duplicate data
+sum(is.na(pitnacree$Timestamp))
+sum(duplicated(pitnacree$Timestamp))
+sum(is.na(pitnacree$Value))
+
+# Check the number of extracted peaks
+nrow(cand)
+nrow(peaks_passed)
+
+# Check the number of hydrographs used in PCA
+nrow(Y)
+
+# Calculate duration of each extracted event (hours)
+duration <- (peaks_passed$peak_end -
+             peaks_passed$peak_begin) / 4
+
+# Summary statistics
+summary(duration)
+
+# Distribution of event durations
+hist(duration,
+     breaks = 30,
+     main = "Distribution of extracted event durations",
+     xlab = "Duration (hours)",
+     col = "lightblue")
+
+```
+```{r checks2}
+# Investigate the sixth extracted event
+i <- 6
+
+peak <- peaks_passed$max_time[i]
+start <- peaks_passed$peak_begin[i]
+end <- peaks_passed$peak_end[i]
+
+# Plot 72 hours either side of the peak
+lo <- max(1, peak - 72 * 4)
+hi <- min(length(flow), peak + 72 * 4)
+
+plot(pit$Timestamp[lo:hi], flow[lo:hi],
+     type = "l",
+     xlab = "Time",
+     ylab = "Flow (m3/s)",
+     main = "Flood hydrograph with extracted boundaries")
+
+# Add boundaries from findpeaks()
+abline(v = pit$Timestamp[start], col = "blue", lty = 2)
+abline(v = pit$Timestamp[end], col = "red", lty = 2)
+
+# Mark the maximum
+abline(v = pit$Timestamp[peak], col = "darkgreen", lty = 2)
+
+legend("topright",
+       legend = c("Flow", "Start", "End", "Peak"),
+       col = c("black", "blue", "red", "darkgreen"),
+       lty = c(1, 2, 2, 2))
+
+```
+
+```{r checks3}
+# Investigate the sixth event
+i <- 6
+
+peak <- peaks_passed$max_time[i]
+
+lo <- max(1, peak - 72 * 4)
+hi <- min(length(flow), peak + 72 * 4)
+
+# Compare selected peak with maximum flow in the window
+c(
+  Selected_peak = flow[peak],
+  Window_maximum = max(flow[lo:hi], na.rm = TRUE),
+  Ratio = max(flow[lo:hi], na.rm = TRUE) / flow[peak]
+)
+
+# Maximum normalised flow in each PCA hydrograph
+max_flow <- apply(Y, 1, max)
+
+# Summarise the maximum values
+summary(max_flow)
+
+# Count hydrographs with a maximum more than 5% above 1
+sum(max_flow > 1.05)
+``` 
 
