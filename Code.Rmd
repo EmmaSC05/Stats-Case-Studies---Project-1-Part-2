@@ -107,6 +107,159 @@ for (k in 2:nrow(cand)) {
 peaks_passed <- cand[keep, ]
 n_years <- sum(!is.na(flow)) / (steps_per_day * 365.25)
 ```
+```{r find peaks UPDATED}
+threshold     <- 260  # Peaks over threshold (m3/s), change for initial threshold
+steps_per_day <- 96   # 15-minute data resolution (24 * 4)
+
+# Put Pitnacree on a continuous 15-minute grid
+pit <- tibble(
+  Timestamp = seq(
+    min(pitnacree$Timestamp, na.rm= TRUE),
+    max(pitnacree$Timestamp, na.rm=TRUE),
+    by = "15 min"
+  )
+) %>%
+  left_join(
+    pitnacree %>% dplyr::select(Timestamp, Value),
+    by = "Timestamp"
+  )
+
+flow <- pit$Value
+flow_noNA <- replace_na(flow, 0) # 0 ensures peak detection ignores missing intervals
+
+
+# Extract candidate peaks exceeding the specified threshold
+# CHANGED: peakpat allows a flat top (repeated values at the peak); the default
+# pattern skips any peak whose maximum value repeats.
+raw <- findpeaks(flow_noNA, minpeakheight = threshold,
+                 peakpat = "[+]{1,}[0]*[-]{1,}")
+
+cand <- tibble(
+  max_flow   = raw[, 1],
+  max_time   = raw[, 2]
+) %>%
+  arrange(max_time)
+
+# CHANGED: robust start of rise. findpeaks' own start point is reset by any
+# small dip or flat step on the rising limb. Instead, start of rise = last time
+# in the 5 days before the peak when flow was within 10% (of the rise) of the
+# lowest flow in that window.
+lookback <- 5 * steps_per_day
+rise_tol <- 0.10
+
+cand$peak_begin <- sapply(cand$max_time, function(tp) {
+  w0   <- max(1, tp - lookback)
+  seg  <- flow[w0:tp]
+  base <- min(seg, na.rm = TRUE)
+  w0 - 1 + max(which(seg <= base + rise_tol * (flow[tp] - base)))
+})
+
+cand <- cand %>%
+  mutate(ttr = max_time - peak_begin) # Time to rise in 15-min steps
+
+
+# Compute average time to peak from "clean" isolated events
+# CHANGED: isolation is judged against one peak per flood (the largest within
+# +/- 3 days), so a flood's own small wiggles don't make it look "non-isolated".
+dominant <- sapply(cand$max_time, function(tp) {
+  w <- max(1, tp - 3 * steps_per_day):min(length(flow), tp + 3 * steps_per_day)
+  flow[tp] >= max(flow[w], na.rm = TRUE)
+})
+dom_times <- cand$max_time[dominant]
+
+near_other <- sapply(cand$max_time, function(tp) {
+  any(abs(dom_times - tp) < 7 * steps_per_day & dom_times != tp)
+})
+
+clean <- cand %>%
+  mutate(clean = dominant & flow[peak_begin] < 0.5 * max_flow & !near_other &
+                 !is.na(flow[peak_begin]) &
+                 peak_begin > max_time - lookback)  # CHANGED: rise start not at window edge
+
+avg_ttr <- mean(clean$ttr[clean$clean])
+min_sep <- 3 * avg_ttr
+cat(sprintf("Clean events: %d | Avg time to peak: %.2f hours | Min FEH separation: %.2f hours\n",
+            sum(clean$clean), avg_ttr / 4, min_sep / 4))
+
+
+# Filter candidate peaks using FEH independence criteria (unchanged)
+keep <- rep(TRUE, nrow(cand))
+last <- 1
+
+for (k in seq_len(nrow(cand))[-1]) {
+  sep <- cand$max_time[k] - cand$max_time[last]
+  independent <- sep >= min_sep
+
+  if (independent) {
+    trough <- min(flow[cand$max_time[last]:cand$max_time[k]], na.rm = TRUE)
+    independent <- trough < (2/3) * cand$max_flow[last]
+  }
+
+  if (independent) {
+    last <- k
+  } else if (cand$max_flow[k] > cand$max_flow[last]) {
+    keep[last] <- FALSE
+    last <- k
+  } else {
+    keep[k] <- FALSE
+  }
+}
+
+peaks_passed <- cand[keep, ]
+n_years <- sum(!is.na(flow)) / (steps_per_day * 365.25)
+
+
+# ---- NEW: hydrograph extraction for part 2 ---------------------------------
+# Fixed window either side of each peak, aligned at the peak (offset 0).
+# Events whose window runs off the record or contains missing data are dropped.
+hydro_halfw <- 10 * steps_per_day   # +/- 10 days; set to match your part 2 window
+thin        <- 4                    # keep every 4th point (hourly); 1 = all 15-min points
+
+offsets <- seq(-hydro_halfw, hydro_halfw, by = thin)
+
+peaks_passed <- peaks_passed %>%
+  mutate(
+    Timestamp      = pit$Timestamp[max_time],
+    ttr_hours      = ttr / 4,
+    # Duration = hours of the continuous stretch around the peak with flow
+    # above half the peak (a neighbouring flood can't inflate it)
+    halfwidth_hours = sapply(max_time, function(tp) {
+      below <- which(flow < 0.5 * flow[tp])
+      start <- max(c(0, below[below < tp])) + 1
+      end   <- min(c(length(flow) + 1, below[below > tp])) - 1
+      (end - start + 1) / 4
+    }),
+    # Window lies within the record and has no missing data
+    complete_window = max_time - hydro_halfw >= 1 &
+                      max_time + hydro_halfw <= length(flow) &
+                      sapply(max_time, function(tp) {
+                        w <- max(1, tp - hydro_halfw):min(length(flow), tp + hydro_halfw)
+                        !anyNA(flow[w])
+                      }),
+    # No larger flood inside the window (otherwise the normalised shape
+    # exceeds 1 away from the peak and mixes two events)
+    peak_is_window_max = sapply(max_time, function(tp) {
+      w <- max(1, tp - hydro_halfw):min(length(flow), tp + hydro_halfw)
+      max(flow[w], na.rm = TRUE) <= flow[tp]
+    })
+  )
+
+events_p2 <- peaks_passed %>% filter(complete_window, peak_is_window_max)
+
+# Hydrograph matrix: one row per event, one column per time offset
+Q_raw <- t(sapply(events_p2$max_time, function(tp) flow[tp + offsets]))   # m3/s
+Y     <- Q_raw / events_p2$max_flow                                       # normalised: peak = 1
+t_days <- offsets / steps_per_day                                         # time from peak (days)
+
+cat(sprintf(paste0("Independent events: %d over %.1f years\n",
+                   "Dropped for part 2: %d incomplete window, %d larger flood within +/-%g days\n",
+                   "Hydrographs for part 2: %d\n"),
+            nrow(peaks_passed), n_years,
+            sum(!peaks_passed$complete_window),
+            sum(peaks_passed$complete_window & !peaks_passed$peak_is_window_max),
+            hydro_halfw / steps_per_day, nrow(events_p2)))
+
+```
 
 
 ```{r peaks_empty}
@@ -147,7 +300,7 @@ coefs <- t(coef(fit))                # n x (deg+1): intercept + deg coefficients
 Hhat <- cbind(1, B) %*% t(coefs)     # K x n fitted hydrographs
 
 #see approximated hydrograph vs real
-matplot(grid, cbind(H_norm_p[, 6], Hhat[, 6]), type = "l")
+matplot(grid, cbind(H_norm_p[, 3], Hhat[, 3]), type = "l")
 ```
 
 
