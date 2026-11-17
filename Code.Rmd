@@ -350,6 +350,225 @@ lines(t_h, recon, col = "red", lwd = 2, lty = 2)
 legend("topright", legend = c("Original", "Recon"), col = c("black", "red"), lty = c(1, 2), lwd = 2)
 ```
 
+### 7. SETTINGS AND SHARED OBJECTS  (change tuning choices here only)
+
+```{r harry_settings}
+
+cfg <- list(k_pc = 8,        # number of parameters (PCs) kept; 8 = 95% of variance here
+            use_log = TRUE,  # TRUE = model log(shape): keeps simulated flows positive (recommended)
+            m_sim = 100,     # simulated hydrographs per held-out event in cross-validation
+            n_boot = 200,    # bootstrap resamples for the PCA stability check
+            seed = 1)
+set.seed(cfg$seed)
+
+# fig(): draws to the screen AND saves a PNG into ./plots (300 dpi) for Overleaf
+fig <- function(name, w, h, code) {
+  code <- substitute(code);  dir.create("plots", showWarnings = FALSE)
+  eval(code, parent.frame())
+  png(file.path("plots", paste0(name, ".png")), width = w, height = h, units = "in", res = 300)
+  eval(code, parent.frame());  dev.off()
+}
+
+keep_ev   <- !sapply(segs, is.null)             # events that survived get_window()
+Qpeak     <- flow[pk_idx[keep_ev]]              # peak flow of each row of Y (m3/s)
+peak_time <- pit$Timestamp[pk_idx[keep_ev]]
+n_ev <- nrow(Y);  nt <- ncol(Y);  ctr <- which(t_h == 0)
+stopifnot(length(Qpeak) == n_ev, all(abs(Y[, ctr] - 1) < 1e-8))
+cat("Events:", n_ev, "| grid points:", nt, "| peak range:", round(range(Qpeak)), "m3/s\n")
+
+# Shape features used for EDA and validation (same 'time to peak' idea as part 1)
+shape_features <- function(s) {
+  lo <- which(s[1:(ctr - 1)] < 0.5);  hi <- which(s[(ctr + 1):length(s)] < 0.5)
+  l <- if (length(lo)) max(lo) else NA
+  r <- if (length(hi)) ctr + min(hi) else NA
+  c(volume = sum(s),        # area under the shape (hours at peak flow)
+    rise_h = ctr - l,       # hours from last point below 50% of peak to the peak
+    width_h = r - l)        # hours spent above 50% of the peak
+}
+```
+
+### 8. EXPLORATORY ANALYSIS OF THE SHAPES
+
+```{r harry_eda}
+
+pk_col <- colorRampPalette(c("skyblue", "darkblue"))(100)[cut(rank(Qpeak), 100, labels = FALSE)]
+bands  <- apply(Y, 2, quantile, probs = c(.05, .25, .75, .95))
+
+fig("fig1_shapes_eda", 10, 4.5, {
+par(mfrow = c(1, 2))
+matplot(t_h, t(Y), type = "l", lty = 1, col = adjustcolor(pk_col, .5), ylim = c(0, max(Y)),
+        xlab = "Hours from peak", ylab = "Q / Qpeak", main = "Observed shapes (dark = larger peak)")
+matplot(t_h, t(Y), type = "l", lty = 1, col = adjustcolor("grey", .4), ylim = c(0, max(Y)),
+        xlab = "Hours from peak", ylab = "Q / Qpeak", main = "Mean shape (current SEPA) and bands")
+matlines(t_h, t(bands[c(1, 4), ]), lty = 2, col = "red", lwd = 2)
+matlines(t_h, t(bands[c(2, 3), ]), lty = 3, col = "red", lwd = 2)
+lines(t_h, colMeans(Y), lwd = 3)
+par(mfrow = c(1, 1))
+})
+
+feat_obs <- t(apply(Y, 1, shape_features))
+cat("\nShape features: Spearman correlation with log(peak flow)\n")
+print(round(sapply(colnames(feat_obs), function(v)
+  c(rho = cor(feat_obs[, v], log(Qpeak), method = "spearman", use = "complete.obs"),
+    p = cor.test(feat_obs[, v], log(Qpeak), method = "spearman", exact = FALSE)$p.value,
+    n_NA = sum(is.na(feat_obs[, v])))), 3))
+cat("\nEvents per month:\n"); print(table(month(peak_time)))
+```
+
+### 9. A GENERIC REPRESENTATION:  x_i(t) ~= mu(t) + sum_j z_ij A_j(t)
+
+```{r harry_representation}
+#    type = "pca"  : mu = mean shape, A = principal-component loadings
+#    type = "poly" : mu = 0, A = orthogonal polynomial basis (so the same code scores Emma's method)
+
+fit_rep <- function(X, type = c("pca", "poly"), p) {
+  type <- match.arg(type)
+  if (type == "pca") {
+    pc <- prcomp(X, center = TRUE, scale. = FALSE)
+    mu <- pc$center;  A <- pc$rotation[, 1:p, drop = FALSE]
+  } else {
+    mu <- rep(0, ncol(X))
+    A  <- if (p == 1) matrix(1, ncol(X), 1) else cbind(1, poly(seq_len(ncol(X)), p - 1))
+  }
+  Z <- (sweep(X, 2, mu) %*% A) %*% solve(crossprod(A))   # least-squares parameters for each event
+  list(mu = mu, A = A, Z = Z)
+}
+to_scale   <- function(Y) if (cfg$use_log) log(Y) else Y
+from_scale <- function(X) if (cfg$use_log) exp(X) else X
+
+#Choose the number of parameters: leave-one-event-out reconstruction error
+loo_recon <- function(type, p_grid) {
+  X <- to_scale(Y)
+  sapply(p_grid, function(p) {
+    sq <- sapply(seq_len(n_ev), function(i) {
+      rp <- fit_rep(X[-i, , drop = FALSE], type, p)
+      z  <- (X[i, ] - rp$mu) %*% rp$A %*% solve(crossprod(rp$A))   # project the held-out event
+      mean((Y[i, ] - from_scale(rp$mu + as.numeric(rp$A %*% t(z))))^2)
+    })
+    sqrt(mean(sq))
+  })
+}
+p_grid  <- 1:12
+rec_tab <- data.frame(p = p_grid, PCA = loo_recon("pca", p_grid), Polynomial = loo_recon("poly", p_grid))
+pca_s   <- prcomp(to_scale(Y), center = TRUE, scale. = FALSE)   # PCA on the modelling scale (log if use_log)
+cum_pve <- cumsum(pca_s$sdev^2) / sum(pca_s$sdev^2)
+cat("\nLeave-one-out reconstruction RMSE (Q/Qpeak) at the same number of parameters\n"); print(round(rec_tab, 4))
+cat("PCs for 90% / 95% of variance:", which(cum_pve >= .9)[1], "/", which(cum_pve >= .95)[1],
+    "| chosen k_pc =", cfg$k_pc, "\n")
+
+fig("fig2_choose_k", 9, 4.2, {
+par(mfrow = c(1, 2))
+plot(1:15, cum_pve[1:15], type = "b", pch = 19, ylim = c(0, 1), xlab = "Number of PCs",
+     ylab = "Cumulative variance explained", main = "Variance explained")
+abline(h = c(.9, .95), lty = 2); abline(v = cfg$k_pc, col = "red", lty = 2)
+matplot(rec_tab$p, rec_tab[, 2:3], type = "b", pch = 19, lty = 1, col = c("red", "blue"),
+        xlab = "Number of parameters", ylab = "LOO reconstruction RMSE", main = "Representation error")
+legend("topright", c("PCA", "Polynomial"), col = c("red", "blue"), pch = 19, lty = 1, bty = "n")
+par(mfrow = c(1, 1))
+})
+
+#Full-data fit with the chosen k: what each component does, and are the scores related to peak size?
+rp_full <- fit_rep(to_scale(Y), "pca", cfg$k_pc)
+Z       <- rp_full$Z
+fig("fig3_pc_effects", 11, 4, {
+par(mfrow = c(1, 3))
+for (j in 1:3) {
+  eff <- 2 * sd(Z[, j]) * rp_full$A[, j]
+  matplot(t_h, from_scale(cbind(rp_full$mu, rp_full$mu + eff, rp_full$mu - eff)), type = "l", lty = c(1, 2, 2),
+          col = c("black", "red", "blue"), lwd = 2, xlab = "Hours from peak", ylab = "Q / Qpeak",
+          main = sprintf("PC%d: %.0f%% of variance", j, 100 * pca_s$sdev[j]^2 / sum(pca_s$sdev^2)))
+  if (j == 1) legend("topright", c("mean shape", "+2 SD", "-2 SD"), col = c("black", "red", "blue"), lty = c(1, 2, 2), lwd = 2, bty = "n", cex = .8)
+}
+par(mfrow = c(1, 1))
+})
+
+dep <- t(sapply(1:cfg$k_pc, function(j) {
+  ct <- cor.test(Z[, j], log(Qpeak), method = "spearman", exact = FALSE)
+  c(PC = j, rho = unname(ct$estimate), p = ct$p.value, shapiro_p = shapiro.test(Z[, j])$p.value)
+}))
+cat("\nScores vs log(peak flow) (Spearman) and normality of scores (Shapiro-Wilk)\n"); print(round(dep, 3))
+fig("fig4_scores_pairs", 7, 7, pairs(Z[, 1:4], col = adjustcolor(pk_col, .8), pch = 19, labels = paste0("PC", 1:4),
+      main = "Scores (dark = larger peak)"))
+
+# Stability of the leading PCs: resample events, refit, compare loadings (|correlation| with original)
+boot_load <- replicate(cfg$n_boot, {
+  pb <- prcomp(to_scale(Y)[sample(n_ev, replace = TRUE), ], center = TRUE, scale. = FALSE)
+  sapply(1:4, function(j) abs(cor(pb$rotation[, j], pca_s$rotation[, j])))
+})
+cat("\nBootstrap stability of loadings (|correlation| with full-data PC): 5%, 50%, 95%\n")
+print(round(apply(boot_load, 1, quantile, c(.05, .5, .95)), 2))
+fig("fig5_pc_stability", 6, 4, boxplot(t(boot_load), names = paste0("PC", 1:4), ylim = c(0, 1),
+    ylab = "|correlation| with full-data loading", main = "Bootstrap stability of loadings"))
+```
+
+### 10. Simulating shapes and validating (leave-one-event-out)
+
+```{r harry_validation}
+# rep  : "none" (raw shapes) | "pca" | "poly"
+# dist : "fixed" = mean shape, no uncertainty (current SEPA practice) | "mvn" = multivariate normal for the parameters z
+
+fit_model <- function(Ytr, rep, dist, k) {
+  if (rep == "none") return(list(rep = rep, dist = dist, mu = colMeans(Ytr)))
+  rp <- fit_rep(to_scale(Ytr), rep, k)
+  c(rp, list(rep = rep, dist = dist, zbar = colMeans(rp$Z), S = cov(rp$Z)))
+}
+sim_shapes <- function(m, n) {
+  if (m$rep == "none") return(matrix(m$mu, n, length(m$mu), byrow = TRUE))
+  z <- if (m$dist == "fixed") matrix(m$zbar, n, length(m$zbar), byrow = TRUE) else MASS::mvrnorm(n, m$zbar, m$S)
+  from_scale(sweep(matrix(z, n) %*% t(m$A), 2, m$mu, "+"))
+}
+clean_shape <- function(raw) { s <- pmax(raw, 0); s[, ctr] <- 1; s }      # no negative flow; s(0) = 1
+simulate_hydrographs <- function(n, Qpeak, model) Qpeak * clean_shape(sim_shapes(model, n))   # n x nt flows (m3/s)
+
+# energy score: proper score for a whole curve (lower = better); rewards sharp AND well-calibrated ensembles
+es_fun <- function(S, y) {
+  m <- nrow(S)
+  (mean(sqrt(rowSums(sweep(S, 2, y)^2))) - sum(dist(S)) / (m * (m - 1))) / sqrt(length(y))
+}
+
+
+# 11. LEAVE-ONE-EVENT-OUT CROSS-VALIDATION (same k for PCA and polynomial)
+
+methods <- data.frame(name = c("Fixed mean shape (SEPA)", "PCA + MVN", "Polynomial + MVN"),
+                      rep  = c("none", "pca", "poly"), dist = c("fixed", "mvn", "mvn"), stringsAsFactors = FALSE)
+cv <- do.call(rbind, lapply(seq_len(n_ev), function(i) do.call(rbind, lapply(seq_len(nrow(methods)), function(j) {
+  md <- fit_model(Y[-i, , drop = FALSE], methods$rep[j], methods$dist[j], cfg$k_pc)   # refit on n-1 events
+  S  <- clean_shape(sim_shapes(md, cfg$m_sim));  y <- Y[i, ]                          # simulate, score vs held-out
+  q  <- apply(S[, -ctr], 2, quantile, c(.05, .25, .75, .95));  yy <- y[-ctr]
+  data.frame(event = i, method = methods$name[j], rmse_mean = sqrt(mean((colMeans(S) - y)^2)),
+             energy = es_fun(S, y), cov50 = mean(yy >= q[2, ] & yy <= q[3, ]), cov90 = mean(yy >= q[1, ] & yy <= q[4, ]))
+}))))
+
+ES <- sapply(methods$name, function(m) cv$energy[cv$method == m])
+bi <- replicate(1000, sample(n_ev, replace = TRUE))
+gain <- t(sapply(methods$name, function(m) quantile(apply(bi, 2, function(ix) mean(ES[ix, m] - ES[ix, 1])), c(.025, .975))))
+tab <- aggregate(cbind(rmse_mean, energy, cov50, cov90) ~ method, data = cv, FUN = mean)
+tab <- tab[match(methods$name, tab$method), ]
+tab$n_param <- c(0, rep(cfg$k_pc + cfg$k_pc * (cfg$k_pc + 1) / 2, 2))
+tab$energy_gain_vs_fixed <- tab$energy - tab$energy[1];  tab$CI_low <- gain[, 1];  tab$CI_high <- gain[, 2]
+cat("\nLEAVE-ONE-EVENT-OUT VALIDATION (lower = better for RMSE/energy; coverage targets 0.50 / 0.90)\n")
+print(format(tab, digits = 3), row.names = FALSE)
+
+#Figure: simulated vs observed shapes (full-data fit, one draw per observed event)
+m_pca <- fit_model(Y, "pca", "mvn", cfg$k_pc);  m_fix <- fit_model(Y, "none", "fixed", 0)
+sim_pca <- clean_shape(sim_shapes(m_pca, n_ev))
+fig("fig6_sim_vs_obs", 11, 4.5, {
+par(mfrow = c(1, 3))
+matplot(t_h, t(Y), type = "l", lty = 1, col = adjustcolor("grey30", .3), ylim = c(0, 1.5),
+        main = "Observed shapes", xlab = "Hours from peak", ylab = "Q / Qpeak")
+matplot(t_h, t(sim_pca), type = "l", lty = 1, col = adjustcolor("red", .3), ylim = c(0, 1.5),
+        main = "PCA simulated shapes", xlab = "Hours from peak", ylab = "Q / Qpeak")
+matplot(t_h, cbind(t(apply(Y, 2, quantile, c(.05, .5, .95))), t(apply(sim_pca, 2, quantile, c(.05, .5, .95))), m_fix$mu),
+        type = "l", lty = c(2, 1, 2, 2, 1, 2, 1), col = c(rep("black", 3), rep("red", 3), "blue"), lwd = c(1, 2, 1, 1, 2, 1, 2),
+        ylim = c(0, 1.2), main = "5/50/95% envelopes", xlab = "Hours from peak", ylab = "Q / Qpeak")
+legend("topright", c("observed", "PCA simulated", "fixed (SEPA)"), col = c("black", "red", "blue"), lty = 1, bty = "n", cex = .7)
+par(mfrow = c(1, 1))
+})
+
+fig("fig7_energy_scores", 6, 4.5, boxplot(ES, names = c("Fixed", "PCA", "Polynomial"), outline = FALSE,
+    ylab = "Energy score per held-out event (lower = better)", main = "Leave-one-event-out energy score"))
+
+```
 
 ## Emma C
 
