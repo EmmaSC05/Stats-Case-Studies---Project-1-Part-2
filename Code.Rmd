@@ -272,36 +272,96 @@ cat(sprintf(paste0("Independent events: %d over %.1f years\n",
 
 
 ```{r scale peaks to same grid, normalise}
-K    <- 101                          # grid points per hydrograph
-grid <- seq(0, 1, length.out = K)
+# Uses Y, t_days and events_p2 from the peaks chunk.
+# Y: n x K matrix of hydrographs normalised so the peak = 1, aligned at the
+# peak (t_days = 0), on a fixed +/-10-day window.
 
-resample_event <- function(i) {
-  idx <- peaks_passed$peak_begin[i]:peaks_passed$peak_end[i]
-  x   <- (seq_along(idx) - 1) / (length(idx) - 1)   # time / width, in [0,1]
-  approx(x, pit$Value[idx], xout = grid)$y               # linearly interpolate to grid
+Yt <- t(Y)                                    # K x n: one column per event, as before
+pk <- events_p2$max_flow                      # peak flows (part 1 / emulator input)
+
+rmse <- function(A, B) sqrt(colMeans((A - B)^2))   # per-event RMSE (normalised scale)
+
+# ---- Method 1a: one global orthogonal polynomial over the whole window -------
+# (your original approach, now on the peak-aligned window)
+fit_global <- function(deg) {
+  B   <- poly(t_days, deg)
+  fit <- lm(Yt ~ B)
+  list(coefs = t(coef(fit)), Hhat = fitted(fit))
 }
 
-H <- sapply(seq_len(nrow(peaks_passed)), resample_event)   # K x n matrix
-width <- peaks_passed$peak_end - peaks_passed$peak_begin   #keep the widths as suggested
-pk    <- peaks_passed$max_flow
+# ---- Method 1b: separate rising and falling limbs, on the log scale -----------
+# log s(t) = sum_j a_j * phi_j(t) for t <= 0, and sum_j b_j * psi_j(t) for t >= 0,
+# where phi, psi are orthonormalised versions of t, t^2, ..., t^deg.
+# No intercept, so s(0) = 1 exactly; the log scale guarantees s(t) > 0;
+# the orthonormal basis keeps the coefficients well conditioned.
+limb_basis <- function(tt, deg) qr.Q(qr(outer(tt, 1:deg, `^`)))
 
-H_norm_p    <- sweep(H, 2, pk, "/")                        # try normalising by peak?
+fit_limbs <- function(deg) {
+  L  <- t_days <= 0
+  R  <- t_days >= 0
+  BL <- limb_basis(t_days[L], deg)
+  BR <- limb_basis(t_days[R], deg)
+  logY <- log(Yt)
+  aL <- crossprod(BL, logY[L, , drop = FALSE])   # least squares (orthonormal basis)
+  aR <- crossprod(BR, logY[R, , drop = FALSE])
+  Hhat <- matrix(NA_real_, nrow(Yt), ncol(Yt))
+  Hhat[L, ] <- exp(BL %*% aL)
+  Hhat[R, ] <- exp(BR %*% aR)
+  list(coefs = t(rbind(aL, aR)),                 # n x (2 * deg)
+       Hhat  = Hhat,
+       BL = BL, BR = BR)
+}
+
+# ---- Choose the degree: reconstruction error vs number of coefficients --------
+degs <- 1:10
+deg_table <- data.frame(
+  deg               = degs,
+  global_n_coefs    = degs + 1,
+  global_rmse       = sapply(degs, function(d) median(rmse(Yt, fit_global(d)$Hhat))),
+  global_peak_value = sapply(degs, function(d) median(fit_global(d)$Hhat[t_days == 0, ])),
+  limbs_n_coefs     = 2 * degs,
+  limbs_rmse        = sapply(degs, function(d) median(rmse(Yt, fit_limbs(d)$Hhat)))
+)
+print(round(deg_table, 3))
+# global_peak_value should be ~1; a global polynomial usually can't reach the peak.
+
+plot(deg_table$global_n_coefs, deg_table$global_rmse, type = "b", log = "y",
+     ylim = range(deg_table[, c("global_rmse", "limbs_rmse")]),
+     xlab = "Number of shape coefficients", ylab = "Median reconstruction RMSE (normalised)")
+lines(deg_table$limbs_n_coefs, deg_table$limbs_rmse, type = "b", pch = 2)
+legend("topright", c("Global polynomial", "Two-limb log polynomial"), pch = c(1, 2), lty = 1)
+
+# ---- Fit the chosen model ------------------------------------------------------
+deg   <- 3                                  # set from the table/plot above (elbow)
+fit   <- fit_limbs(deg)
+coefs <- fit$coefs                          # n x 2*deg: the data for the joint distribution
+Hhat  <- fit$Hhat                           # K x n fitted hydrographs
+
+# ---- Check: real vs fitted for a few events ------------------------------------
+par(mfrow = c(2, 2))
+for (i in sample(ncol(Yt), 4)) {
+  matplot(t_days, cbind(Yt[, i], Hhat[, i], fit_global(8)$Hhat[, i]), type = "l",
+          lty = c(1, 1, 2), col = c("black", "red", "grey50"),
+          xlab = "Days from peak", ylab = "Flow / peak flow",
+          main = format(events_p2$Timestamp[i], "%d %b %Y"))
+}
+legend("topright", c("Observed", "Two-limb fit", "Global deg 8"),
+       col = c("black", "red", "grey50"), lty = c(1, 1, 2), cex = 0.8)
+par(mfrow = c(1, 1))
+
+# ---- Simulating a new hydrograph from coefficients (for later) -----------------
+# Given a coefficient vector b (length 2*deg), e.g. drawn from the fitted joint
+# distribution:
+#   s <- numeric(length(t_days))
+#   s[t_days <= 0] <- exp(fit$BL %*% b[1:deg])
+#   s[t_days >= 0] <- exp(fit$BR %*% b[(deg + 1):(2 * deg)])
+#   Q <- Qpeak * s                     # try normalising by peak?
 
 ```
 
 
 ```{r linear fit}
-deg <- 8 #just for a decent approx, will need to try a few and measure reconstruction error before choosing one
-B   <- poly(grid, deg)               # orthogonal polynomial basis, same for all events
 
-fit   <- lm(H_norm_p ~ B)                  # matrix response with one regression per event
-coefs <- t(coef(fit))                # n x (deg+1): intercept + deg coefficients
-
-#reconstruciton
-Hhat <- cbind(1, B) %*% t(coefs)     # K x n fitted hydrographs
-
-#see approximated hydrograph vs real
-matplot(grid, cbind(H_norm_p[, 3], Hhat[, 3]), type = "l")
 ```
 
 
