@@ -108,6 +108,160 @@ peaks_passed <- cand[keep, ]
 n_years <- sum(!is.na(flow)) / (steps_per_day * 365.25)
 ```
 
+```{r find peaks UPDATED}
+threshold     <- 260  # Peaks over threshold (m3/s), change for initial threshold
+steps_per_day <- 96   # 15-minute data resolution (24 * 4)
+
+# Put Pitnacree on a continuous 15-minute grid
+pit <- tibble(
+  Timestamp = seq(
+    min(pitnacree$Timestamp, na.rm= TRUE),
+    max(pitnacree$Timestamp, na.rm=TRUE),
+    by = "15 min"
+  )
+) %>%
+  left_join(
+    pitnacree %>% dplyr::select(Timestamp, Value),
+    by = "Timestamp"
+  )
+
+flow <- pit$Value
+flow_noNA <- replace_na(flow, 0) # 0 ensures peak detection ignores missing intervals
+
+
+# Extract candidate peaks exceeding the specified threshold
+# CHANGED: peakpat allows a flat top (repeated values at the peak); the default
+# pattern skips any peak whose maximum value repeats.
+raw <- findpeaks(flow_noNA, minpeakheight = threshold,
+                 peakpat = "[+]{1,}[0]*[-]{1,}")
+
+cand <- tibble(
+  max_flow   = raw[, 1],
+  max_time   = raw[, 2]
+) %>%
+  arrange(max_time)
+
+# CHANGED: robust start of rise. findpeaks' own start point is reset by any
+# small dip or flat step on the rising limb. Instead, start of rise = last time
+# in the 5 days before the peak when flow was within 10% (of the rise) of the
+# lowest flow in that window.
+lookback <- 5 * steps_per_day
+rise_tol <- 0.10
+
+cand$peak_begin <- sapply(cand$max_time, function(tp) {
+  w0   <- max(1, tp - lookback)
+  seg  <- flow[w0:tp]
+  base <- min(seg, na.rm = TRUE)
+  w0 - 1 + max(which(seg <= base + rise_tol * (flow[tp] - base)))
+})
+
+cand <- cand %>%
+  mutate(ttr = max_time - peak_begin) # Time to rise in 15-min steps
+
+
+# Compute average time to peak from "clean" isolated events
+# CHANGED: isolation is judged against one peak per flood (the largest within
+# +/- 3 days), so a flood's own small wiggles don't make it look "non-isolated".
+dominant <- sapply(cand$max_time, function(tp) {
+  w <- max(1, tp - 3 * steps_per_day):min(length(flow), tp + 3 * steps_per_day)
+  flow[tp] >= max(flow[w], na.rm = TRUE)
+})
+dom_times <- cand$max_time[dominant]
+
+near_other <- sapply(cand$max_time, function(tp) {
+  any(abs(dom_times - tp) < 7 * steps_per_day & dom_times != tp)
+})
+
+clean <- cand %>%
+  mutate(clean = dominant & flow[peak_begin] < 0.5 * max_flow & !near_other &
+                 !is.na(flow[peak_begin]) &
+                 peak_begin > max_time - lookback)  # CHANGED: rise start not at window edge
+
+avg_ttr <- mean(clean$ttr[clean$clean])
+min_sep <- 3 * avg_ttr
+cat(sprintf("Clean events: %d | Avg time to peak: %.2f hours | Min FEH separation: %.2f hours\n",
+            sum(clean$clean), avg_ttr / 4, min_sep / 4))
+
+
+# Filter candidate peaks using FEH independence criteria (unchanged)
+keep <- rep(TRUE, nrow(cand))
+last <- 1
+
+for (k in seq_len(nrow(cand))[-1]) {
+  sep <- cand$max_time[k] - cand$max_time[last]
+  independent <- sep >= min_sep
+
+  if (independent) {
+    trough <- min(flow[cand$max_time[last]:cand$max_time[k]], na.rm = TRUE)
+    independent <- trough < (2/3) * cand$max_flow[last]
+  }
+
+  if (independent) {
+    last <- k
+  } else if (cand$max_flow[k] > cand$max_flow[last]) {
+    keep[last] <- FALSE
+    last <- k
+  } else {
+    keep[k] <- FALSE
+  }
+}
+
+peaks_passed <- cand[keep, ]
+n_years <- sum(!is.na(flow)) / (steps_per_day * 365.25)
+
+
+# ---- NEW: hydrograph extraction for part 2 ---------------------------------
+# Fixed window either side of each peak, aligned at the peak (offset 0).
+# Events whose window runs off the record or contains missing data are dropped.
+hydro_halfw <- 10 * steps_per_day   # +/- 10 days; set to match your part 2 window
+thin        <- 4                    # keep every 4th point (hourly); 1 = all 15-min points
+
+offsets <- seq(-hydro_halfw, hydro_halfw, by = thin)
+
+peaks_passed <- peaks_passed %>%
+  mutate(
+    Timestamp      = pit$Timestamp[max_time],
+    ttr_hours      = ttr / 4,
+    # Duration = hours of the continuous stretch around the peak with flow
+    # above half the peak (a neighbouring flood can't inflate it)
+    halfwidth_hours = sapply(max_time, function(tp) {
+      below <- which(flow < 0.5 * flow[tp])
+      start <- max(c(0, below[below < tp])) + 1
+      end   <- min(c(length(flow) + 1, below[below > tp])) - 1
+      (end - start + 1) / 4
+    }),
+    # Window lies within the record and has no missing data
+    complete_window = max_time - hydro_halfw >= 1 &
+                      max_time + hydro_halfw <= length(flow) &
+                      sapply(max_time, function(tp) {
+                        w <- max(1, tp - hydro_halfw):min(length(flow), tp + hydro_halfw)
+                        !anyNA(flow[w])
+                      }),
+    # No larger flood inside the window (otherwise the normalised shape
+    # exceeds 1 away from the peak and mixes two events)
+    peak_is_window_max = sapply(max_time, function(tp) {
+      w <- max(1, tp - hydro_halfw):min(length(flow), tp + hydro_halfw)
+      max(flow[w], na.rm = TRUE) <= flow[tp]
+    })
+  )
+
+events_p2 <- peaks_passed %>% filter(complete_window, peak_is_window_max)
+
+# Hydrograph matrix: one row per event, one column per time offset
+Q_raw <- t(sapply(events_p2$max_time, function(tp) flow[tp + offsets]))   # m3/s
+Y     <- Q_raw / events_p2$max_flow                                       # normalised: peak = 1
+t_days <- offsets / steps_per_day                                         # time from peak (days)
+
+cat(sprintf(paste0("Independent events: %d over %.1f years\n",
+                   "Dropped for part 2: %d incomplete window, %d larger flood within +/-%g days\n",
+                   "Hydrographs for part 2: %d\n"),
+            nrow(peaks_passed), n_years,
+            sum(!peaks_passed$complete_window),
+            sum(peaks_passed$complete_window & !peaks_passed$peak_is_window_max),
+            hydro_halfw / steps_per_day, nrow(events_p2)))
+
+```
+
 
 ```{r peaks_empty}
 
@@ -118,36 +272,96 @@ n_years <- sum(!is.na(flow)) / (steps_per_day * 365.25)
 
 
 ```{r scale peaks to same grid, normalise}
-K    <- 101                          # grid points per hydrograph
-grid <- seq(0, 1, length.out = K)
+# Uses Y, t_days and events_p2 from the peaks chunk.
+# Y: n x K matrix of hydrographs normalised so the peak = 1, aligned at the
+# peak (t_days = 0), on a fixed +/-10-day window.
 
-resample_event <- function(i) {
-  idx <- peaks_passed$peak_begin[i]:peaks_passed$peak_end[i]
-  x   <- (seq_along(idx) - 1) / (length(idx) - 1)   # time / width, in [0,1]
-  approx(x, pit$Value[idx], xout = grid)$y               # linearly interpolate to grid
+Yt <- t(Y)                                    # K x n: one column per event, as before
+pk <- events_p2$max_flow                      # peak flows (part 1 / emulator input)
+
+rmse <- function(A, B) sqrt(colMeans((A - B)^2))   # per-event RMSE (normalised scale)
+
+# ---- Method 1a: one global orthogonal polynomial over the whole window -------
+# (your original approach, now on the peak-aligned window)
+fit_global <- function(deg) {
+  B   <- poly(t_days, deg)
+  fit <- lm(Yt ~ B)
+  list(coefs = t(coef(fit)), Hhat = fitted(fit))
 }
 
-H <- sapply(seq_len(nrow(peaks_passed)), resample_event)   # K x n matrix
-width <- peaks_passed$peak_end - peaks_passed$peak_begin   #keep the widths as suggested
-pk    <- peaks_passed$max_flow
+# ---- Method 1b: separate rising and falling limbs, on the log scale -----------
+# log s(t) = sum_j a_j * phi_j(t) for t <= 0, and sum_j b_j * psi_j(t) for t >= 0,
+# where phi, psi are orthonormalised versions of t, t^2, ..., t^deg.
+# No intercept, so s(0) = 1 exactly; the log scale guarantees s(t) > 0;
+# the orthonormal basis keeps the coefficients well conditioned.
+limb_basis <- function(tt, deg) qr.Q(qr(outer(tt, 1:deg, `^`)))
 
-H_norm_p    <- sweep(H, 2, pk, "/")                        # try normalising by peak?
+fit_limbs <- function(deg) {
+  L  <- t_days <= 0
+  R  <- t_days >= 0
+  BL <- limb_basis(t_days[L], deg)
+  BR <- limb_basis(t_days[R], deg)
+  logY <- log(Yt)
+  aL <- crossprod(BL, logY[L, , drop = FALSE])   # least squares (orthonormal basis)
+  aR <- crossprod(BR, logY[R, , drop = FALSE])
+  Hhat <- matrix(NA_real_, nrow(Yt), ncol(Yt))
+  Hhat[L, ] <- exp(BL %*% aL)
+  Hhat[R, ] <- exp(BR %*% aR)
+  list(coefs = t(rbind(aL, aR)),                 # n x (2 * deg)
+       Hhat  = Hhat,
+       BL = BL, BR = BR)
+}
+
+# ---- Choose the degree: reconstruction error vs number of coefficients --------
+degs <- 1:10
+deg_table <- data.frame(
+  deg               = degs,
+  global_n_coefs    = degs + 1,
+  global_rmse       = sapply(degs, function(d) median(rmse(Yt, fit_global(d)$Hhat))),
+  global_peak_value = sapply(degs, function(d) median(fit_global(d)$Hhat[t_days == 0, ])),
+  limbs_n_coefs     = 2 * degs,
+  limbs_rmse        = sapply(degs, function(d) median(rmse(Yt, fit_limbs(d)$Hhat)))
+)
+print(round(deg_table, 3))
+# global_peak_value should be ~1; a global polynomial usually can't reach the peak.
+
+plot(deg_table$global_n_coefs, deg_table$global_rmse, type = "b", log = "y",
+     ylim = range(deg_table[, c("global_rmse", "limbs_rmse")]),
+     xlab = "Number of shape coefficients", ylab = "Median reconstruction RMSE (normalised)")
+lines(deg_table$limbs_n_coefs, deg_table$limbs_rmse, type = "b", pch = 2)
+legend("topright", c("Global polynomial", "Two-limb log polynomial"), pch = c(1, 2), lty = 1)
+
+# ---- Fit the chosen model ------------------------------------------------------
+deg   <- 3                                  # set from the table/plot above (elbow)
+fit   <- fit_limbs(deg)
+coefs <- fit$coefs                          # n x 2*deg: the data for the joint distribution
+Hhat  <- fit$Hhat                           # K x n fitted hydrographs
+
+# ---- Check: real vs fitted for a few events ------------------------------------
+par(mfrow = c(2, 2))
+for (i in sample(ncol(Yt), 4)) {
+  matplot(t_days, cbind(Yt[, i], Hhat[, i], fit_global(8)$Hhat[, i]), type = "l",
+          lty = c(1, 1, 2), col = c("black", "red", "grey50"),
+          xlab = "Days from peak", ylab = "Flow / peak flow",
+          main = format(events_p2$Timestamp[i], "%d %b %Y"))
+}
+legend("topright", c("Observed", "Two-limb fit", "Global deg 8"),
+       col = c("black", "red", "grey50"), lty = c(1, 1, 2), cex = 0.8)
+par(mfrow = c(1, 1))
+
+# ---- Simulating a new hydrograph from coefficients (for later) -----------------
+# Given a coefficient vector b (length 2*deg), e.g. drawn from the fitted joint
+# distribution:
+#   s <- numeric(length(t_days))
+#   s[t_days <= 0] <- exp(fit$BL %*% b[1:deg])
+#   s[t_days >= 0] <- exp(fit$BR %*% b[(deg + 1):(2 * deg)])
+#   Q <- Qpeak * s                     # try normalising by peak?
 
 ```
 
 
 ```{r linear fit}
-deg <- 8 #just for a decent approx, will need to try a few and measure reconstruction error before choosing one
-B   <- poly(grid, deg)               # orthogonal polynomial basis, same for all events
 
-fit   <- lm(H_norm_p ~ B)                  # matrix response with one regression per event
-coefs <- t(coef(fit))                # n x (deg+1): intercept + deg coefficients
-
-#reconstruciton
-Hhat <- cbind(1, B) %*% t(coefs)     # K x n fitted hydrographs
-
-#see approximated hydrograph vs real
-matplot(grid, cbind(H_norm_p[, 6], Hhat[, 6]), type = "l")
 ```
 
 
@@ -197,6 +411,225 @@ lines(t_h, recon, col = "red", lwd = 2, lty = 2)
 legend("topright", legend = c("Original", "Recon"), col = c("black", "red"), lty = c(1, 2), lwd = 2)
 ```
 
+### 7. SETTINGS AND SHARED OBJECTS  (change tuning choices here only)
+
+```{r harry_settings}
+
+cfg <- list(k_pc = 8,        # number of parameters (PCs) kept; 8 = 95% of variance here
+            use_log = TRUE,  # TRUE = model log(shape): keeps simulated flows positive (recommended)
+            m_sim = 100,     # simulated hydrographs per held-out event in cross-validation
+            n_boot = 200,    # bootstrap resamples for the PCA stability check
+            seed = 1)
+set.seed(cfg$seed)
+
+# fig(): draws to the screen AND saves a PNG into ./plots (300 dpi) for Overleaf
+fig <- function(name, w, h, code) {
+  code <- substitute(code);  dir.create("plots", showWarnings = FALSE)
+  eval(code, parent.frame())
+  png(file.path("plots", paste0(name, ".png")), width = w, height = h, units = "in", res = 300)
+  eval(code, parent.frame());  dev.off()
+}
+
+keep_ev   <- !sapply(segs, is.null)             # events that survived get_window()
+Qpeak     <- flow[pk_idx[keep_ev]]              # peak flow of each row of Y (m3/s)
+peak_time <- pit$Timestamp[pk_idx[keep_ev]]
+n_ev <- nrow(Y);  nt <- ncol(Y);  ctr <- which(t_h == 0)
+stopifnot(length(Qpeak) == n_ev, all(abs(Y[, ctr] - 1) < 1e-8))
+cat("Events:", n_ev, "| grid points:", nt, "| peak range:", round(range(Qpeak)), "m3/s\n")
+
+# Shape features used for EDA and validation (same 'time to peak' idea as part 1)
+shape_features <- function(s) {
+  lo <- which(s[1:(ctr - 1)] < 0.5);  hi <- which(s[(ctr + 1):length(s)] < 0.5)
+  l <- if (length(lo)) max(lo) else NA
+  r <- if (length(hi)) ctr + min(hi) else NA
+  c(volume = sum(s),        # area under the shape (hours at peak flow)
+    rise_h = ctr - l,       # hours from last point below 50% of peak to the peak
+    width_h = r - l)        # hours spent above 50% of the peak
+}
+```
+
+### 8. EXPLORATORY ANALYSIS OF THE SHAPES
+
+```{r harry_eda}
+
+pk_col <- colorRampPalette(c("skyblue", "darkblue"))(100)[cut(rank(Qpeak), 100, labels = FALSE)]
+bands  <- apply(Y, 2, quantile, probs = c(.05, .25, .75, .95))
+
+fig("fig1_shapes_eda", 10, 4.5, {
+par(mfrow = c(1, 2))
+matplot(t_h, t(Y), type = "l", lty = 1, col = adjustcolor(pk_col, .5), ylim = c(0, max(Y)),
+        xlab = "Hours from peak", ylab = "Q / Qpeak", main = "Observed shapes (dark = larger peak)")
+matplot(t_h, t(Y), type = "l", lty = 1, col = adjustcolor("grey", .4), ylim = c(0, max(Y)),
+        xlab = "Hours from peak", ylab = "Q / Qpeak", main = "Mean shape (current SEPA) and bands")
+matlines(t_h, t(bands[c(1, 4), ]), lty = 2, col = "red", lwd = 2)
+matlines(t_h, t(bands[c(2, 3), ]), lty = 3, col = "red", lwd = 2)
+lines(t_h, colMeans(Y), lwd = 3)
+par(mfrow = c(1, 1))
+})
+
+feat_obs <- t(apply(Y, 1, shape_features))
+cat("\nShape features: Spearman correlation with log(peak flow)\n")
+print(round(sapply(colnames(feat_obs), function(v)
+  c(rho = cor(feat_obs[, v], log(Qpeak), method = "spearman", use = "complete.obs"),
+    p = cor.test(feat_obs[, v], log(Qpeak), method = "spearman", exact = FALSE)$p.value,
+    n_NA = sum(is.na(feat_obs[, v])))), 3))
+cat("\nEvents per month:\n"); print(table(month(peak_time)))
+```
+
+### 9. A GENERIC REPRESENTATION:  x_i(t) ~= mu(t) + sum_j z_ij A_j(t)
+
+```{r harry_representation}
+#    type = "pca"  : mu = mean shape, A = principal-component loadings
+#    type = "poly" : mu = 0, A = orthogonal polynomial basis (so the same code scores Emma's method)
+
+fit_rep <- function(X, type = c("pca", "poly"), p) {
+  type <- match.arg(type)
+  if (type == "pca") {
+    pc <- prcomp(X, center = TRUE, scale. = FALSE)
+    mu <- pc$center;  A <- pc$rotation[, 1:p, drop = FALSE]
+  } else {
+    mu <- rep(0, ncol(X))
+    A  <- if (p == 1) matrix(1, ncol(X), 1) else cbind(1, poly(seq_len(ncol(X)), p - 1))
+  }
+  Z <- (sweep(X, 2, mu) %*% A) %*% solve(crossprod(A))   # least-squares parameters for each event
+  list(mu = mu, A = A, Z = Z)
+}
+to_scale   <- function(Y) if (cfg$use_log) log(Y) else Y
+from_scale <- function(X) if (cfg$use_log) exp(X) else X
+
+#Choose the number of parameters: leave-one-event-out reconstruction error
+loo_recon <- function(type, p_grid) {
+  X <- to_scale(Y)
+  sapply(p_grid, function(p) {
+    sq <- sapply(seq_len(n_ev), function(i) {
+      rp <- fit_rep(X[-i, , drop = FALSE], type, p)
+      z  <- (X[i, ] - rp$mu) %*% rp$A %*% solve(crossprod(rp$A))   # project the held-out event
+      mean((Y[i, ] - from_scale(rp$mu + as.numeric(rp$A %*% t(z))))^2)
+    })
+    sqrt(mean(sq))
+  })
+}
+p_grid  <- 1:12
+rec_tab <- data.frame(p = p_grid, PCA = loo_recon("pca", p_grid), Polynomial = loo_recon("poly", p_grid))
+pca_s   <- prcomp(to_scale(Y), center = TRUE, scale. = FALSE)   # PCA on the modelling scale (log if use_log)
+cum_pve <- cumsum(pca_s$sdev^2) / sum(pca_s$sdev^2)
+cat("\nLeave-one-out reconstruction RMSE (Q/Qpeak) at the same number of parameters\n"); print(round(rec_tab, 4))
+cat("PCs for 90% / 95% of variance:", which(cum_pve >= .9)[1], "/", which(cum_pve >= .95)[1],
+    "| chosen k_pc =", cfg$k_pc, "\n")
+
+fig("fig2_choose_k", 9, 4.2, {
+par(mfrow = c(1, 2))
+plot(1:15, cum_pve[1:15], type = "b", pch = 19, ylim = c(0, 1), xlab = "Number of PCs",
+     ylab = "Cumulative variance explained", main = "Variance explained")
+abline(h = c(.9, .95), lty = 2); abline(v = cfg$k_pc, col = "red", lty = 2)
+matplot(rec_tab$p, rec_tab[, 2:3], type = "b", pch = 19, lty = 1, col = c("red", "blue"),
+        xlab = "Number of parameters", ylab = "LOO reconstruction RMSE", main = "Representation error")
+legend("topright", c("PCA", "Polynomial"), col = c("red", "blue"), pch = 19, lty = 1, bty = "n")
+par(mfrow = c(1, 1))
+})
+
+#Full-data fit with the chosen k: what each component does, and are the scores related to peak size?
+rp_full <- fit_rep(to_scale(Y), "pca", cfg$k_pc)
+Z       <- rp_full$Z
+fig("fig3_pc_effects", 11, 4, {
+par(mfrow = c(1, 3))
+for (j in 1:3) {
+  eff <- 2 * sd(Z[, j]) * rp_full$A[, j]
+  matplot(t_h, from_scale(cbind(rp_full$mu, rp_full$mu + eff, rp_full$mu - eff)), type = "l", lty = c(1, 2, 2),
+          col = c("black", "red", "blue"), lwd = 2, xlab = "Hours from peak", ylab = "Q / Qpeak",
+          main = sprintf("PC%d: %.0f%% of variance", j, 100 * pca_s$sdev[j]^2 / sum(pca_s$sdev^2)))
+  if (j == 1) legend("topright", c("mean shape", "+2 SD", "-2 SD"), col = c("black", "red", "blue"), lty = c(1, 2, 2), lwd = 2, bty = "n", cex = .8)
+}
+par(mfrow = c(1, 1))
+})
+
+dep <- t(sapply(1:cfg$k_pc, function(j) {
+  ct <- cor.test(Z[, j], log(Qpeak), method = "spearman", exact = FALSE)
+  c(PC = j, rho = unname(ct$estimate), p = ct$p.value, shapiro_p = shapiro.test(Z[, j])$p.value)
+}))
+cat("\nScores vs log(peak flow) (Spearman) and normality of scores (Shapiro-Wilk)\n"); print(round(dep, 3))
+fig("fig4_scores_pairs", 7, 7, pairs(Z[, 1:4], col = adjustcolor(pk_col, .8), pch = 19, labels = paste0("PC", 1:4),
+      main = "Scores (dark = larger peak)"))
+
+# Stability of the leading PCs: resample events, refit, compare loadings (|correlation| with original)
+boot_load <- replicate(cfg$n_boot, {
+  pb <- prcomp(to_scale(Y)[sample(n_ev, replace = TRUE), ], center = TRUE, scale. = FALSE)
+  sapply(1:4, function(j) abs(cor(pb$rotation[, j], pca_s$rotation[, j])))
+})
+cat("\nBootstrap stability of loadings (|correlation| with full-data PC): 5%, 50%, 95%\n")
+print(round(apply(boot_load, 1, quantile, c(.05, .5, .95)), 2))
+fig("fig5_pc_stability", 6, 4, boxplot(t(boot_load), names = paste0("PC", 1:4), ylim = c(0, 1),
+    ylab = "|correlation| with full-data loading", main = "Bootstrap stability of loadings"))
+```
+
+### 10. Simulating shapes and validating (leave-one-event-out)
+
+```{r harry_validation}
+# rep  : "none" (raw shapes) | "pca" | "poly"
+# dist : "fixed" = mean shape, no uncertainty (current SEPA practice) | "mvn" = multivariate normal for the parameters z
+
+fit_model <- function(Ytr, rep, dist, k) {
+  if (rep == "none") return(list(rep = rep, dist = dist, mu = colMeans(Ytr)))
+  rp <- fit_rep(to_scale(Ytr), rep, k)
+  c(rp, list(rep = rep, dist = dist, zbar = colMeans(rp$Z), S = cov(rp$Z)))
+}
+sim_shapes <- function(m, n) {
+  if (m$rep == "none") return(matrix(m$mu, n, length(m$mu), byrow = TRUE))
+  z <- if (m$dist == "fixed") matrix(m$zbar, n, length(m$zbar), byrow = TRUE) else MASS::mvrnorm(n, m$zbar, m$S)
+  from_scale(sweep(matrix(z, n) %*% t(m$A), 2, m$mu, "+"))
+}
+clean_shape <- function(raw) { s <- pmax(raw, 0); s[, ctr] <- 1; s }      # no negative flow; s(0) = 1
+simulate_hydrographs <- function(n, Qpeak, model) Qpeak * clean_shape(sim_shapes(model, n))   # n x nt flows (m3/s)
+
+# energy score: proper score for a whole curve (lower = better); rewards sharp AND well-calibrated ensembles
+es_fun <- function(S, y) {
+  m <- nrow(S)
+  (mean(sqrt(rowSums(sweep(S, 2, y)^2))) - sum(dist(S)) / (m * (m - 1))) / sqrt(length(y))
+}
+
+
+# 11. LEAVE-ONE-EVENT-OUT CROSS-VALIDATION (same k for PCA and polynomial)
+
+methods <- data.frame(name = c("Fixed mean shape (SEPA)", "PCA + MVN", "Polynomial + MVN"),
+                      rep  = c("none", "pca", "poly"), dist = c("fixed", "mvn", "mvn"), stringsAsFactors = FALSE)
+cv <- do.call(rbind, lapply(seq_len(n_ev), function(i) do.call(rbind, lapply(seq_len(nrow(methods)), function(j) {
+  md <- fit_model(Y[-i, , drop = FALSE], methods$rep[j], methods$dist[j], cfg$k_pc)   # refit on n-1 events
+  S  <- clean_shape(sim_shapes(md, cfg$m_sim));  y <- Y[i, ]                          # simulate, score vs held-out
+  q  <- apply(S[, -ctr], 2, quantile, c(.05, .25, .75, .95));  yy <- y[-ctr]
+  data.frame(event = i, method = methods$name[j], rmse_mean = sqrt(mean((colMeans(S) - y)^2)),
+             energy = es_fun(S, y), cov50 = mean(yy >= q[2, ] & yy <= q[3, ]), cov90 = mean(yy >= q[1, ] & yy <= q[4, ]))
+}))))
+
+ES <- sapply(methods$name, function(m) cv$energy[cv$method == m])
+bi <- replicate(1000, sample(n_ev, replace = TRUE))
+gain <- t(sapply(methods$name, function(m) quantile(apply(bi, 2, function(ix) mean(ES[ix, m] - ES[ix, 1])), c(.025, .975))))
+tab <- aggregate(cbind(rmse_mean, energy, cov50, cov90) ~ method, data = cv, FUN = mean)
+tab <- tab[match(methods$name, tab$method), ]
+tab$n_param <- c(0, rep(cfg$k_pc + cfg$k_pc * (cfg$k_pc + 1) / 2, 2))
+tab$energy_gain_vs_fixed <- tab$energy - tab$energy[1];  tab$CI_low <- gain[, 1];  tab$CI_high <- gain[, 2]
+cat("\nLEAVE-ONE-EVENT-OUT VALIDATION (lower = better for RMSE/energy; coverage targets 0.50 / 0.90)\n")
+print(format(tab, digits = 3), row.names = FALSE)
+
+#Figure: simulated vs observed shapes (full-data fit, one draw per observed event)
+m_pca <- fit_model(Y, "pca", "mvn", cfg$k_pc);  m_fix <- fit_model(Y, "none", "fixed", 0)
+sim_pca <- clean_shape(sim_shapes(m_pca, n_ev))
+fig("fig6_sim_vs_obs", 11, 4.5, {
+par(mfrow = c(1, 3))
+matplot(t_h, t(Y), type = "l", lty = 1, col = adjustcolor("grey30", .3), ylim = c(0, 1.5),
+        main = "Observed shapes", xlab = "Hours from peak", ylab = "Q / Qpeak")
+matplot(t_h, t(sim_pca), type = "l", lty = 1, col = adjustcolor("red", .3), ylim = c(0, 1.5),
+        main = "PCA simulated shapes", xlab = "Hours from peak", ylab = "Q / Qpeak")
+matplot(t_h, cbind(t(apply(Y, 2, quantile, c(.05, .5, .95))), t(apply(sim_pca, 2, quantile, c(.05, .5, .95))), m_fix$mu),
+        type = "l", lty = c(2, 1, 2, 2, 1, 2, 1), col = c(rep("black", 3), rep("red", 3), "blue"), lwd = c(1, 2, 1, 1, 2, 1, 2),
+        ylim = c(0, 1.2), main = "5/50/95% envelopes", xlab = "Hours from peak", ylab = "Q / Qpeak")
+legend("topright", c("observed", "PCA simulated", "fixed (SEPA)"), col = c("black", "red", "blue"), lty = 1, bty = "n", cex = .7)
+par(mfrow = c(1, 1))
+})
+
+fig("fig7_energy_scores", 6, 4.5, boxplot(ES, names = c("Fixed", "PCA", "Polynomial"), outline = FALSE,
+    ylab = "Energy score per held-out event (lower = better)", main = "Leave-one-event-out energy score"))
+
+```
 
 ## Emma C
 
