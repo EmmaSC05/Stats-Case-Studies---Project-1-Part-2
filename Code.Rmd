@@ -309,4 +309,85 @@ problem_events <- tibble(
 # Display the 27 cases
 print(n=27, head(problem_events, 27))
 
+# Check whether problematic windows contain another larger retained peak
+peak_idx <- peaks_passed$max_time
+peak_flow <- peaks_passed$max_flow
+
+larger_neighbour <- sapply(valid, function(i) {
+  any(
+    abs(peak_idx - peak_idx[i]) <= 72 * 4 &
+    peak_flow > peak_flow[i]
+  )
+})
+
+sum(larger_neighbour[max_ratio > 1.05])
 ```
+```{r checks4}
+# Compare different hydrograph window lengths
+window_hours <- c(24, 36, 48, 72)
+
+window_check <- lapply(window_hours, function(h) {
+
+  ratios <- sapply(peaks_passed$max_time, function(i) {
+
+    lo <- i - h * 4
+    hi <- i + h * 4
+
+    if (lo < 1 || hi > length(flow)) return(NA_real_)
+
+    seg <- flow[lo:hi]
+
+    if (anyNA(seg)) return(NA_real_)
+
+    max(seg) / flow[i]
+  })
+
+  data.frame(
+    Window = paste0("±", h, " hours"),
+    Usable = sum(!is.na(ratios)),
+    Problematic = sum(ratios > 1.05, na.rm = TRUE),
+    Percentage = round(100 * mean(ratios > 1.05,
+                                  na.rm = TRUE), 1)
+  )
+})
+
+do.call(rbind, window_check)
+```
+
+```{r}
+# Compare potential hydrograph window lengths
+i <- 6
+
+peak <- peaks_passed$max_time[i]
+
+# Extract 72 hours either side
+lo <- max(1, peak - 72 * 4)
+hi <- min(length(flow), peak + 72 * 4)
+
+idx <- lo:hi
+hours <- (idx - peak) / 4
+
+# Plot hydrograph
+plot(hours, flow[idx],
+     type = "l",
+     lwd = 2,
+     xlab = "Hours from selected peak",
+     ylab = "Flow (m3/s)",
+     main = "Comparison of hydrograph window lengths")
+
+# Mark selected peak
+abline(v = 0, col = "black", lwd = 2)
+
+# Mark potential window boundaries
+abline(v = c(-24, 24), col = "blue", lty = 2)
+abline(v = c(-36, 36), col = "orange", lty = 2)
+abline(v = c(-48, 48), col = "purple", lty = 2)
+
+legend("topright",
+       legend = c("Selected peak", "24 hours",
+                  "36 hours", "48 hours"),
+       col = c("black", "blue", "orange", "purple"),
+       lty = c(1, 2, 2, 2),
+       bty = "n")
+```
+
