@@ -489,3 +489,104 @@ When requiring both the half peak period to be captured and the selected peak to
 This suggests that 120hrs provides a good compromise between capturing high flow behavious and avoiding having overlapping flood peaks. 
 
 Capturing half peak behaviour does nor guarantee that the entire hydrograph, esp its lower flow rising and recession limbs are being represented properly or good enough.
+
+
+```{r CHECKING FULL HYDROGRAPHS FOR 120HR}
+
+# Investigate how well the windows capture the wider hydrograph shape
+
+window_lengths <- c(72, 120, 240)
+
+flow <- d$pit$Value
+peak_indices <- d$peaks_passed$max_time
+
+# Examine every retained peak for each window
+limb_checks <- purrr::map_dfr(window_lengths, function(h) {
+
+  purrr::map_dfr(seq_along(peak_indices), function(i) {
+
+    peak <- peak_indices[i]
+    lo <- peak - h * 4
+    hi <- peak + h * 4
+
+    # Exclude incomplete windows
+    if (lo < 1 || hi > length(flow)) return(NULL)
+
+    seg <- flow[lo:hi]
+
+    if (anyNA(seg)) return(NULL)
+
+    selected_peak <- flow[peak]
+    n <- h * 4
+
+    # Separate rising and falling portions
+    left <- seg[1:n]
+    right <- seg[(n + 2):length(seg)]
+
+    tibble(
+      Window = h,
+      Event = i,
+
+      # Is selected peak the window maximum?
+      Peak_is_max =
+        max(seg) <= selected_peak * (1 + 1e-8),
+
+      # Does flow fall below 25% on both sides?
+      Rising_below_25 =
+        any(left < 0.25 * selected_peak),
+
+      Falling_below_25 =
+        any(right < 0.25 * selected_peak),
+
+      # Flow at the window boundaries,
+      # relative to selected peak
+      Left_boundary_ratio =
+        seg[1] / selected_peak,
+
+      Right_boundary_ratio =
+        tail(seg, 1) / selected_peak
+    )
+  })
+})
+
+# Summarise windows with selected peak as maximum
+limb_summary <- limb_checks %>%
+  filter(Peak_is_max) %>%
+  group_by(Window) %>%
+  summarise(
+    Usable = n(),
+
+    Both_below_25 = sum(
+      Rising_below_25 & Falling_below_25
+    ),
+
+    Percent_both = round(
+      100 * Both_below_25 / Usable, 1
+    ),
+
+    Median_left_boundary = round(
+      median(Left_boundary_ratio), 3
+    ),
+
+    Median_right_boundary = round(
+      median(Right_boundary_ratio), 3
+    ),
+
+    .groups = "drop"
+  )
+
+print(limb_summary, width = Inf)
+
+
+```
+The results suggest that longer hydrograph windows capture more of the lower-flow portions of flood events.
+
+For the ±72-hour window, only 2 of 118 usable hydrographs (1.7%) fall below 25% of their selected peak discharge on both sides. This increases to 7 of 117 (6.0%) for ±120 hours, and 42 of 98 (42.9%) for ±240 hours.
+
+The median normalised discharge at the left and right boundaries also decreases as window length increases. For ±120 hours, the median boundary flows are 0.295 and 0.391, respectively. The higher right-boundary discharge may indicate a more prolonged recession limb, although background flow and neighbouring events may also contribute.
+
+These findings suggest that longer windows capture more of the wider hydrograph shape. However, failing to fall below 25% of peak discharge does not necessarily indicate that the flood has been truncated, since substantial background river flow may be present.
+
+Combined with the previous half-peak analysis, ±120 hours remains a promising compromise between capturing high-flow behaviour and retaining events without larger neighbouring peaks. Nevertheless, the ±240-hour window captures more lower-flow behaviour, highlighting a limitation of the shorter window.
+
+Recommendation: Consider ±120 hours as a common window for model comparison, while acknowledging that it may omit part of the wider rising and recession limbs. The final choice should be informed by the intended flood-modelling application and validated model performance.
