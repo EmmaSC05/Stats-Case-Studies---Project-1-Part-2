@@ -249,7 +249,7 @@ events_p2 <- peaks_passed %>% filter(complete_window, peak_is_window_max)
 
 # Hydrograph matrix: one row per event, one column per time offset
 Q_raw <- t(sapply(events_p2$max_time, function(tp) flow[tp + offsets]))   # m3/s
-Y     <- Q_raw / events_p2$max_flow                                       # normalised: peak = 1
+Y_shape     <- Q_raw / events_p2$max_flow                                       # normalised: peak = 1
 t_days <- offsets / steps_per_day                                         # time from peak (days)
 
 cat(sprintf(paste0("Independent events: %d over %.1f years\n",
@@ -276,7 +276,7 @@ cat(sprintf(paste0("Independent events: %d over %.1f years\n",
 # Y: n x K matrix of hydrographs normalised so the peak = 1, aligned at the
 # peak (t_days = 0), on a fixed +/-10-day window.
 
-Yt <- t(Y)                                    # K x n: one column per event, as before
+Yt <- t(Y_shape)                                    # K x n: one column per event, as before
 pk <- events_p2$max_flow                      # peak flows (part 1 / emulator input)
 
 rmse <- function(A, B) sqrt(colMeans((A - B)^2))   # per-event RMSE (normalised scale)
