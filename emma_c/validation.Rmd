@@ -1,0 +1,592 @@
+---
+title: "Emma C – Hydrograph validation"
+author: "Emma Crawford"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+
+library(tidyverse)
+
+# Load the saved group data
+d <- readRDS("inputs.rds")
+```
+
+
+
+
+```{r Data quality checks}
+
+# Check missing and duplicate timestamps
+sum(is.na(d$pitnacree$Timestamp))
+sum(duplicated(d$pitnacree$Timestamp))
+
+# Check missing flow values in the imported data
+sum(is.na(d$pitnacree$Value))
+
+# Check missing observations on the 15-minute grid
+sum(is.na(d$pit$Value))
+
+# Number of candidate and selected peaks
+nrow(d$cand)
+nrow(d$peaks_passed)
+
+# Number of hydrographs available for each method
+nrow(d$Y_poly)
+nrow(d$Y_pca)
+
+```
+Initial checks found no missing data, duplicated timestamps, no missing flow values and no missing observations on the 15min grid. This suggests tht the data is complete at the expected temporal resolution, although it does not independently verify the quality of the recorded flows.
+
+Of the 1003 candidate peaks, only 120 were retained following the peak independence check. However, only 98 hydrographs were available for polynomal fitting vs 119 for PCA. This is because of different extraction and filtering procedures.
+
+FURTHER INVESTIGATION NEEDED.
+
+NEXT STEPS: look at why events are being excluded from each dataset, and find a consistend set of hydrographs for comparing modelling approaches.
+
+
+```{r  Peak extraction validation}
+
+# Half-peak width from the updated extraction code
+width_hours <- d$peaks_passed$halfwidth_hours
+
+# Summary statistics
+summary(width_hours)
+
+# Plot distribution
+hist(
+  width_hours,
+  breaks = 30,
+  main = "Distribution of half-peak widths",
+  xlab = "Half-peak width (hours)",
+  col = "purple"
+)
+
+
+```
+The distribution of half-peak widths is very right skewed, with a median of 57.88 hours and a mean of 87.67 hours. Most events have short widths but a small number are considerably longer, with max reaching 574.75hrs (approx 24 days)
+
+This long widths might represent extended periods of high river discharge or multiple overlapping flood events. Since the width is calculated as the cts period above half the selected peak flow, it does not necessarily correspond to the duration of one independent flood.
+
+NEXT STEPS: Investigate the very long events to determine if their widths are reasonable and assess whether the hydrograph windows for PCA and polynomial fitting capture the relevant flood behaviour.
+
+
+```{r investigating unusual long high flow events}
+# Count events with unusually long half-peak widths
+
+sum(width_hours > 144)  # Longer than a full +/-72h window
+sum(width_hours > 480)  # Longer than a full +/-10-day window
+
+# Identify the events with widths exceeding 144 hours
+long_events <- d$peaks_passed %>%
+  mutate(Event = row_number()) %>%
+  filter(halfwidth_hours > 144) %>%
+  select(Event, Timestamp, max_flow,
+         halfwidth_hours, max_time) %>%
+  arrange(desc(halfwidth_hours))
+
+long_events
+```
+
+of the 120 retained flood peaks, 14 have half-peak widths exceeding 144hrs, while 4 exceed 480hrs. The longest is event 97 (7th Jan 2016), with a half-peak width of 574.75hrs (approx 24 days)
+
+These results sugest that the fixed hydrograph windows we use right now are not fully capturing the complete high-flow periods of all events. However, unusually large half-peaks widths which might also arise when the multiple "flood" peaks occur during a extended period of higher river flow.
+
+NEXT STEPS: visually look at these events to understand the unusually large widths and determine whether they represent individual "flood" events or overlapping "flood" activity.
+
+
+```{r Plotting event with greatest half peak width}
+# Find the event with the largest half-peak width
+i <- which.max(width_hours)
+
+# Locate its peak in the original flow data
+peak <- d$peaks_passed$max_time[i]
+
+# Extract 30 days either side of the selected peak
+lo <- max(1, peak - 30 * 96)
+hi <- min(nrow(d$pit), peak + 30 * 96)
+
+idx <- lo:hi
+hours <- (idx - peak) / 4
+
+# Plot the observed river discharge
+plot(hours, d$pit$Value[idx],
+     type = "l",
+     lwd = 2,
+     xlab = "Hours from selected peak",
+     ylab = "Discharge (m3/s)",
+     main = paste("Event", i, "- longest half-peak width"))
+
+# Mark selected peak
+abline(v = 0, col = "darkgreen", lty = 2)
+
+# Mark half-peak discharge threshold
+abline(h = d$peaks_passed$max_flow[i] / 2,
+       col = "red", lty = 2)
+
+# Mark Harry's current +/-72-hour window
+abline(v = c(-72, 72), col = "blue", lty = 3)
+
+legend("topright",
+       legend = c("Selected peak", "Half-peak threshold",
+                  "+/-72-hour boundaries"),
+       col = c("darkgreen", "red", "blue"),
+       lty = c(2, 2, 3),
+       bty = "n")
+```
+
+Event 97 was investigated because it has the largest calculated half-peak width (574.75 hours).
+
+The hydrograph shows several substantial flood peaks preceding the selected peak, with discharge remaining above the half-peak threshold for an extended period. This suggests that the unusually large width reflects a sequence of elevated flows containing multiple peaks, rather than necessarily representing one continuous, independent flood event.
+
+The ±72-hour window also appears to contain discharge values exceeding the selected peak, although this needs to be confirmed numerically.
+
+NEXT STEPS: Determine whether the selected peak is the maximum within its extraction window and investigate how frequently neighbouring larger peaks occur in the retained hydrographs. WHY larger peak in window :(
+
+```{r investigating neighbouring retained peaks around event 97}
+
+
+i <- 97
+
+d$peaks_passed %>%
+  mutate(
+    Event = row_number(),
+    Hours_from_97 = as.numeric(
+      difftime(Timestamp, Timestamp[i], units = "hours")
+    )
+  ) %>%
+  filter(abs(Hours_from_97) <= 300) %>%
+  select(Event, Timestamp, max_flow, Hours_from_97)
+
+# Check maximum discharge within +/-72 hours of Event 97
+
+peak <- d$peaks_passed$max_time[97]
+
+window <- (peak - 72*4):(peak + 72*4)
+
+c(
+  Selected_peak = d$pit$Value[peak],
+  Window_maximum = max(d$pit$Value[window]),
+  Ratio = max(d$pit$Value[window]) /
+          d$pit$Value[peak]
+)
+
+```
+
+The investigation identified two retained independent peaks: Event 96 (733.587 m³/s) and Event 97 (306.117 m³/s), separated by 192.25 hours. This suggests that the earlier, substantially larger flood was recognised separately by the peak extraction procedure.
+
+However, within the ±72-hour window surrounding Event 97, the maximum observed discharge was 415.442 m³/s. This is approximately 35.7% greater than the selected peak, giving a maximum normalised flow of 1.357.
+
+This indicates a potential issue with the hydrographs used for PCA, as the selected peak is not necessarily the maximum discharge within its extraction window.
+
+NEXT STEPS: Identify the timing of this larger discharge and determine whether it was excluded by the independence criteria or missed during initial peak detection. This will help establish whether the issue arises from peak extraction or hydrograph window selection.
+
+```{r investigating larger peak in event 97's window}
+
+i <- 97
+peak <- d$peaks_passed$max_time[i]
+
+# Extract +/-72-hour window
+lo <- peak - 72 * 4
+hi <- peak + 72 * 4
+
+window <- lo:hi
+
+# Find the position of the maximum discharge
+max_idx <- window[which.max(d$pit$Value[window])]
+
+# Display its details
+data.frame(
+  Timestamp = d$pit$Timestamp[max_idx],
+  Maximum_flow = d$pit$Value[max_idx],
+  Hours_from_event97 = (max_idx - peak) / 4
+)
+
+
+# Check candidate peaks within +/-72 hours of Event 97
+
+d$cand %>%
+  mutate(
+    Timestamp = d$pit$Timestamp[max_time],
+    Hours_from_event97 = (max_time - peak) / 4
+  ) %>%
+  filter(abs(Hours_from_event97) <= 72) %>%
+  select(Timestamp, max_flow, Hours_from_event97) %>%
+  arrange(desc(max_flow))
+```
+The investigation confirmed that the much larger event 96 (733.587m³/s) was retained seperately from event 97 (306.117m³/s), with the peaks separated by 192.25hrs
+
+Within event 97's 72hr window, the max observed discharge was 415.442m³/s (Exactly at the left boundary). Several other local maxima were identified as candidate peaks, including one of 393.743m³/s on 4th jan 2016, but these were not retained after we did the independence critieria
+
+This indicates that the peak detetection algorithm did identify neighbouring high-flow activity, but the retained peak and the maximum flow within the extraction window are not necessarily the same
+
+Consequently, normalising by selecting peaks produces values exceeding 1, potentially affecting the interpretation of the hydrograph shapes being used for PCA.
+
+NEXT STEPS: Examine the time separation and intervening troughs to determine why the neighbouring candidate peaks were discarded, before assessing whether the hydrograph window or event selection process should be changed. Look at entire dataset to find how widespread problem is
+
+```{r WHY JAN 4 CANDIDATE NOT INCLUDED}
+# Investigate why the January 4 candidate was excluded
+
+# Retained peaks
+p96 <- d$peaks_passed$max_time[96]
+p97 <- d$peaks_passed$max_time[97]
+
+# Candidate peak at 4 January, 17:00
+candidate <- d$cand %>%
+  filter(max_time > p96,
+         max_time < p97,
+         abs(max_flow - 393.743) < 0.01)
+
+p_jan4 <- candidate$max_time
+
+# Compare the separation and intervening troughs
+data.frame(
+  Comparison = c("Event 96 to Jan 4", "Jan 4 to Event 97"),
+  Separation_hours = c(
+    (p_jan4 - p96) / 4,
+    (p97 - p_jan4) / 4
+  ),
+  Minimum_flow = c(
+    min(d$pit$Value[p96:p_jan4]),
+    min(d$pit$Value[p_jan4:p97])
+  ),
+  Two_thirds_earlier_peak = c(
+    (2/3) * d$pit$Value[p96],
+    (2/3) * d$pit$Value[p_jan4]
+  )
+)
+```
+
+The independence criteria was investigated for the peaks around event 97
+
+The min flow between event 96 and the jan 4th candidate was 197.884m³/s, this is below the required two-thirds threshold of 489.058m³/s. Similarly, the min flow between jan 4th and event 97 was 209.413m³/s, this is below the threshold of 262.495m³/s
+
+Therefore, both comparisons satisfy the condition we set for troughs for determining peak independence.
+
+However, the peaks are separated by 123hrs and 69.25hrs, respectively. Whether they satisfy the minimum time seperation criteria still needs to be checked.
+
+NEXT STEPS: compare these seperation whith the calculated min seperation threshhold to investigate why jan 4th candidate was disgarded whilst event 97 was kept.
+
+```{r}
+# Compare peak separations with the minimum required threshold
+
+# Replace NA with the value obtained from min_sep / 4
+min_sep_hours <- 136.0588
+
+comparison <- data.frame(
+  Comparison = c("Event 96 to Jan 4",
+                 "Jan 4 to Event 97",
+                 "Event 96 to Event 97"),
+  Separation_hours = c(123, 69.25, 192.25)
+)
+
+comparison$Required_hours <- min_sep_hours
+
+comparison$Meets_time_rule <- (
+  comparison$Separation_hours >= min_sep_hours
+)
+
+comparison
+```
+The calculated minimum seperation threshold was 136.06hrs. The january 4th candidate occurred at 123hrs after event 96, failing time separation. In contrast, event 97 occured 192.25hrs after event 96 satisfying the time separation.
+
+The intervening discharge also satisfied the trough condiditon, this explains why the event 97 was kept as an independent peak while the earlier jan 4th candidate was discarded
+
+Therefore, the selection of event 97 is consistent with the independence criteria. However, its +-72hr hudrograph has flow 35.7% greater than the selected peak so its maximum normalised flow is bigger than 1.
+
+NEXT STEPS: Check how often this issue occurs across all 119 hydrographs to determine whether it represents a wider problem with hydrograph extraction AND MAKE SURE THIS WORKS FOR ALL MODELS I ACCIDENTALLY HAVE ONLY DONE PCA OOPS :(
+
+```{r Checking hydrographs across modelling approaches}
+
+# Check maximum normalised discharge for each observed hydrograph
+
+# PCA hydrographs (Harry: +/-72 hours)
+max_pca <- apply(d$Y_pca, 1, max)
+
+# Polynomial hydrographs (Emma D: +/-10 days)
+max_poly <- apply(d$Y_poly, 1, max)
+
+# Compare the two input datasets
+input_check <- data.frame(
+  Method = c("PCA", "Polynomial"),
+  Total = c(length(max_pca), length(max_poly)),
+  Problematic = c(
+    sum(max_pca > 1.05),
+    sum(max_poly > 1.05)
+  ),
+  Percentage = round(c(
+    100 * mean(max_pca > 1.05),
+    100 * mean(max_poly > 1.05)
+  ), 2),
+  Maximum_ratio = c(max(max_pca), max(max_poly))
+)
+
+input_check
+
+
+# Check the fixed mean-shape baseline
+# Harry calculates this using the PCA dataset
+fixed_shape <- colMeans(d$Y_pca)
+
+fixed_check <- data.frame(
+  Method = "Fixed mean shape",
+  Maximum_ratio = max(fixed_shape),
+  Peak_at_centre = fixed_shape[which(d$t_h == 0)]
+)
+
+fixed_check
+# Check any exceedance, allowing for numerical rounding
+sum(max_pca > 1 + 1e-8)
+sum(max_poly > 1 + 1e-8)
+
+```
+
+
+### Interpretation
+
+Of the 119 PCA hydrographs, only one (0.84%) had a maximum normalised discharge exceeding 1.05, with a maximum ratio of 1.357. This is consistent with the previously investigated Event 97 and suggests that substantially larger neighbouring peaks are relatively uncommon within the current ±72-hour extraction windows.
+
+In contrast, none of the 98 polynomial hydrographs exceeded a normalised maximum of 1. This is expected because the polynomial dataset explicitly excludes windows containing larger neighbouring peaks.
+
+The fixed mean hydrograph also had a maximum of 1, occurring at the selected peak time. However, averaging hydrographs can conceal individual anomalies.
+
+Although the results are reassuring, they do not demonstrate that one modelling approach is superior, since the PCA and polynomial methods currently use different extraction windows and filtering procedures.
+
+NEXT STEPS: Investigate how hydrograph window length affects data retention, neighbouring peaks and the representation of flood durations, to help establish a consistent dataset for comparing the modelling approaches.
+
+
+```{r COMPARING HYDROGRAPH WINDOW LENGTH}
+
+# Compare window lengths for all 120 retained peaks
+
+window_hours <- c(24, 36, 48, 72, 120, 240)
+
+flow <- d$pit$Value
+peak_indices <- d$peaks_passed$max_time
+
+# Check each peak under each proposed window length
+window_results <- purrr::map_dfr(window_hours, function(h) {
+
+  purrr::map_dfr(seq_along(peak_indices), function(i) {
+
+    peak <- peak_indices[i]
+    lo <- peak - h * 4
+    hi <- peak + h * 4
+
+    # Check window is within record and has no missing data
+    valid <- lo >= 1 && hi <= length(flow)
+
+    if (valid) {
+      valid <- !anyNA(flow[lo:hi])
+    }
+
+    if (!valid) {
+      return(tibble(
+        Window_hours = h,
+        Event = i,
+        Complete = FALSE,
+        Larger_peak = NA,
+        Larger_5pct = NA,
+        Halfpeak_captured = NA,
+        High_boundary = NA
+      ))
+    }
+
+    # Extract window and selected peak
+    seg <- flow[lo:hi]
+    selected_peak <- flow[peak]
+    half_peak <- selected_peak / 2
+
+    # Can we see flow drop below half-peak
+    # on both sides of the selected peak?
+    left <- seg[1:(h * 4)]
+    right <- seg[(h * 4 + 2):length(seg)]
+
+    tibble(
+      Window_hours = h,
+      Event = i,
+      Complete = TRUE,
+
+      # Is there a larger discharge in the window?
+      Larger_peak = max(seg) > selected_peak * (1 + 1e-8),
+
+      # Is it more than 5% larger?
+      Larger_5pct = max(seg) > 1.05 * selected_peak,
+
+      # Does the window contain the complete
+      # continuous half-peak period around the peak?
+      Halfpeak_captured =
+        any(left < half_peak) &&
+        any(right < half_peak),
+
+      # Is discharge still at least half the selected
+      # peak at either window boundary?
+      High_boundary =
+        seg[1] >= half_peak ||
+        tail(seg, 1) >= half_peak
+    )
+  })
+})
+
+
+# Summarise the comparison of hydrograph windows
+
+window_comparison <- window_results %>%
+  group_by(Window_hours) %>%
+  summarise(
+    Total_peaks = n(),
+    Complete_windows = sum(Complete),
+
+    # Count windows with larger neighbouring peaks
+    N_larger_peak = sum(Larger_peak, na.rm = TRUE),
+    N_larger_5pct = sum(Larger_5pct, na.rm = TRUE),
+
+    # Complete windows where selected peak is maximum
+    Usable_peak_max = sum(
+      Complete & !Larger_peak, na.rm = TRUE
+    ),
+
+    # Count windows capturing both half-peak crossings
+    N_halfpeak_captured = sum(
+      Halfpeak_captured, na.rm = TRUE
+    ),
+
+    Captured_percent = round(
+      100 * sum(Halfpeak_captured, na.rm = TRUE) /
+        sum(Complete), 1
+    ),
+
+    # Windows satisfying BOTH desired conditions
+    Usable_and_captured = sum(
+      Complete & !Larger_peak & Halfpeak_captured,
+      na.rm = TRUE
+    ),
+
+    N_high_boundary = sum(
+      High_boundary, na.rm = TRUE
+    ),
+
+    .groups = "drop"
+  )
+
+print(window_comparison, width = Inf)
+
+
+
+```
+
+The window length comparison shows a trade off between capturing flood duration and including the neighbouring peaks.
+
+Shorter windows generally avoid larger peaks but frequently truncate the cts half-peak period. EX. the +-72hr window currently used for pca captures this period for 88 of the 119 complete events (73.9%)
+
+Increasing this to +-120hrs improves this to 109 events (91.6%), with only 2 windows having a larger neighbouring flow. In contrast althourgh the +-240hr window captures the hald peak periods for 114 events (95.8%), 21 windows contain larger neighbouring peaks
+
+When requiring both the half peak period to be captured and the selected peak to be the max, the +-120hr performs the best amongst the considered windows, with 109 suitable hydrographs compared with 88 for 72hrs and 95 for 240hrs.
+
+This suggests that 120hrs provides a good compromise between capturing high flow behavious and avoiding having overlapping flood peaks. 
+
+Capturing half peak behaviour does nor guarantee that the entire hydrograph, esp its lower flow rising and recession limbs are being represented properly or good enough.
+
+
+```{r CHECKING FULL HYDROGRAPHS FOR 120HR}
+
+# Investigate how well the windows capture the wider hydrograph shape
+
+window_lengths <- c(72, 120, 240)
+
+flow <- d$pit$Value
+peak_indices <- d$peaks_passed$max_time
+
+# Examine every retained peak for each window
+limb_checks <- purrr::map_dfr(window_lengths, function(h) {
+
+  purrr::map_dfr(seq_along(peak_indices), function(i) {
+
+    peak <- peak_indices[i]
+    lo <- peak - h * 4
+    hi <- peak + h * 4
+
+    # Exclude incomplete windows
+    if (lo < 1 || hi > length(flow)) return(NULL)
+
+    seg <- flow[lo:hi]
+
+    if (anyNA(seg)) return(NULL)
+
+    selected_peak <- flow[peak]
+    n <- h * 4
+
+    # Separate rising and falling portions
+    left <- seg[1:n]
+    right <- seg[(n + 2):length(seg)]
+
+    tibble(
+      Window = h,
+      Event = i,
+
+      # Is selected peak the window maximum?
+      Peak_is_max =
+        max(seg) <= selected_peak * (1 + 1e-8),
+
+      # Does flow fall below 25% on both sides?
+      Rising_below_25 =
+        any(left < 0.25 * selected_peak),
+
+      Falling_below_25 =
+        any(right < 0.25 * selected_peak),
+
+      # Flow at the window boundaries,
+      # relative to selected peak
+      Left_boundary_ratio =
+        seg[1] / selected_peak,
+
+      Right_boundary_ratio =
+        tail(seg, 1) / selected_peak
+    )
+  })
+})
+
+# Summarise windows with selected peak as maximum
+limb_summary <- limb_checks %>%
+  filter(Peak_is_max) %>%
+  group_by(Window) %>%
+  summarise(
+    Usable = n(),
+
+    Both_below_25 = sum(
+      Rising_below_25 & Falling_below_25
+    ),
+
+    Percent_both = round(
+      100 * Both_below_25 / Usable, 1
+    ),
+
+    Median_left_boundary = round(
+      median(Left_boundary_ratio), 3
+    ),
+
+    Median_right_boundary = round(
+      median(Right_boundary_ratio), 3
+    ),
+
+    .groups = "drop"
+  )
+
+print(limb_summary, width = Inf)
+
+
+```
+The results suggest that longer hydrograph windows capture more of the lower-flow portions of flood events.
+
+For the ±72-hour window, only 2 of 118 usable hydrographs (1.7%) fall below 25% of their selected peak discharge on both sides. This increases to 7 of 117 (6.0%) for ±120 hours, and 42 of 98 (42.9%) for ±240 hours.
+
+The median normalised discharge at the left and right boundaries also decreases as window length increases. For ±120 hours, the median boundary flows are 0.295 and 0.391, respectively. The higher right-boundary discharge may indicate a more prolonged recession limb, although background flow and neighbouring events may also contribute.
+
+These findings suggest that longer windows capture more of the wider hydrograph shape. However, failing to fall below 25% of peak discharge does not necessarily indicate that the flood has been truncated, since substantial background river flow may be present.
+
+Combined with the previous half-peak analysis, ±120 hours remains a promising compromise between capturing high-flow behaviour and retaining events without larger neighbouring peaks. Nevertheless, the ±240-hour window captures more lower-flow behaviour, highlighting a limitation of the shorter window.
+
+Recommendation: Consider ±120 hours as a common window for model comparison, while acknowledging that it may omit part of the wider rising and recession limbs. The final choice should be informed by the intended flood-modelling application and validated model performance.
