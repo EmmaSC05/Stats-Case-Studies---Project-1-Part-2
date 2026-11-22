@@ -276,7 +276,7 @@ matplot(t_days, t(Y_shape), type = "l", lty = 1, col = rgb(0, 0, 0, 0.3),
 ## Emma D
 
 
-```{r scale peaks to same grid, normalise}
+```{r scale peaks to same grid, show what each coefficient represents}
 # Uses Y, t_days and events_p2 from the peaks chunk.
 # Y: n x K matrix of hydrographs normalised so the peak = 1, aligned at the
 # peak (t_days = 0), on a fixed +/-3-day window.
@@ -330,7 +330,7 @@ par(mfrow = c(1, 1))
 ```
 
 
-```{r diagnostics}
+```{r diagnostics for MVN}
 # ---- Diagnostics for the shape coefficients --------------------------------
 logQ <- log(events_p2$max_flow)
 n <- nrow(C); p <- ncol(C)
@@ -373,6 +373,66 @@ print(round(dep, 3))
 
 ```
 
+```{r MVN simulation, spaghetti plots}
+library(mvtnorm)
+set.seed(2026)
+
+# ---- Fit the MVN to all events ------------------------------------------------
+mu    <- colMeans(C)
+Sigma <- cov(C)
+
+# ---- Simulate shapes ------------------------------------------------------------
+S     <- 1000
+C_sim <- rmvnorm(S, mu, Sigma)          # S x p simulated coefficient vectors
+Y_sim <- rebuild(C_sim)                 # K x S simulated normalised hydrographs
+
+# Reference: the observed curves' own polynomial fits (same smoothness as simulations)
+Y_fit <- rebuild(C)                     # K x n
+
+# ---- 1. Observed vs simulated spaghetti plots -----------------------------------
+par(mfrow = c(1, 3))
+ylims <- range(Y_shape, Y_fit, Y_sim[, 1:100])
+matplot(t_days, t(Y_shape), type = "l", lty = 1, col = rgb(0, 0, 0, 0.15),
+        ylim = ylims, main = "Observed", xlab = "Days from peak", ylab = "Flow / peak flow")
+matplot(t_days, Y_fit, type = "l", lty = 1, col = rgb(0, 0, 1, 0.15),
+        ylim = ylims, main = "Polynomial fits to observed", xlab = "Days from peak", ylab = "")
+matplot(t_days, Y_sim[, 1:100], type = "l", lty = 1, col = rgb(1, 0, 0, 0.15),
+        ylim = ylims, main = "Simulated (100 of 1000)", xlab = "Days from peak", ylab = "")
+par(mfrow = c(1, 1))
+
+# ---- 2. Do the simulated bands match the fitted bands? ------------------------
+band <- function(Y) apply(Y, 1, quantile, c(0.05, 0.5, 0.95))   # Y is K x m
+b_fit <- band(Y_fit); b_sim <- band(Y_sim)
+matplot(t_days, t(b_fit), type = "l", lty = c(2, 1, 2), col = "blue", lwd = 2,
+        xlab = "Days from peak", ylab = "Flow / peak flow",
+        main = "Median and 90% bands: fitted observed (blue) vs simulated (red)")
+matlines(t_days, t(b_sim), lty = c(2, 1, 2), col = "red", lwd = 2)
+
+# ---- 3. Plausibility of simulated hydrographs --------------------------------
+at_peak   <- Y_sim[t_days == 0, ]
+max_where <- t_days[apply(Y_sim, 2, which.max)]
+plaus <- c(
+  `% with any negative flow`           = 100 * mean(apply(Y_sim, 2, min) < 0),
+  `% whose maximum is not at t = 0`    = 100 * mean(abs(max_where) > 0.25),  # > 6 h away
+  `% exceeding 1 anywhere`             = 100 * mean(apply(Y_sim, 2, max) > 1),
+  `median value at t = 0`              = median(at_peak)
+)
+round(plaus, 2)
+
+# ---- 4. Hydrological features: simulated vs fitted observed -------------------
+dt <- diff(t_days)[1]
+feat_of <- function(Y) data.frame(volume    = colSums(Y) * dt,
+                                  halfwidth = colSums(Y >= 0.5 * apply(Y, 2, max)) * dt)
+f_fit <- feat_of(Y_fit); f_sim <- feat_of(Y_sim)
+
+par(mfrow = c(1, 2))
+for (v in names(f_fit)) {
+  qqplot(f_fit[[v]], f_sim[[v]], xlab = "Fitted observed", ylab = "Simulated",
+         main = v, pch = 19, col = rgb(0, 0, 0, 0.4))
+  abline(0, 1)
+}
+par(mfrow = c(1, 1))
+```
 
 ## Harry
 
