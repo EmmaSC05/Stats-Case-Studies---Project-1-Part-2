@@ -213,8 +213,8 @@ n_years <- sum(!is.na(flow)) / (steps_per_day * 365.25)
 # ---- NEW: hydrograph extraction for part 2 ---------------------------------
 # Fixed window either side of each peak, aligned at the peak (offset 0).
 # Events whose window runs off the record or contains missing data are dropped.
-hydro_halfw <- 10 * steps_per_day   # +/- 10 days; set to match your part 2 window
-thin        <- 4                    # keep every 4th point (hourly); 1 = all 15-min points
+hydro_halfw <- 3 * steps_per_day   # +/- 10 days; set to match your part 2 window
+thin        <- 1                    # keep every 4th point (hourly); 1 = all 15-min points
 
 offsets <- seq(-hydro_halfw, hydro_halfw, by = thin)
 
@@ -267,6 +267,11 @@ cat(sprintf(paste0("Independent events: %d over %.1f years\n",
 
 ```
 
+```{r}
+
+matplot(t_days, t(Y_shape), type = "l", lty = 1, col = rgb(0, 0, 0, 0.3),
+        xlab = "Days from peak", ylab = "Flow / peak flow")   # spaghetti plot
+```
 
 ## Emma D
 
@@ -274,7 +279,7 @@ cat(sprintf(paste0("Independent events: %d over %.1f years\n",
 ```{r scale peaks to same grid, normalise}
 # Uses Y, t_days and events_p2 from the peaks chunk.
 # Y: n x K matrix of hydrographs normalised so the peak = 1, aligned at the
-# peak (t_days = 0), on a fixed +/-10-day window.
+# peak (t_days = 0), on a fixed +/-3-day window.
 
 Yt <- t(Y_shape)                                    # K x n: one column per event, as before
 pk <- events_p2$max_flow                      # peak flows (part 1 / emulator input)
@@ -282,85 +287,89 @@ pk <- events_p2$max_flow                      # peak flows (part 1 / emulator in
 rmse <- function(A, B) sqrt(colMeans((A - B)^2))   # per-event RMSE (normalised scale)
 
 # ---- Method 1a: one global orthogonal polynomial over the whole window -------
-# (your original approach, now on the peak-aligned window)
+
 fit_global <- function(deg) {
   B   <- poly(t_days, deg)
   fit <- lm(Yt ~ B)
   list(coefs = t(coef(fit)), Hhat = fitted(fit))
 }
 
-# ---- Method 1b: separate rising and falling limbs, on the log scale -----------
-# log s(t) = sum_j a_j * phi_j(t) for t <= 0, and sum_j b_j * psi_j(t) for t >= 0,
-# where phi, psi are orthonormalised versions of t, t^2, ..., t^deg.
-# No intercept, so s(0) = 1 exactly; the log scale guarantees s(t) > 0;
-# the orthonormal basis keeps the coefficients well conditioned.
-limb_basis <- function(tt, deg) qr.Q(qr(outer(tt, 1:deg, `^`)))
-
-fit_limbs <- function(deg) {
-  L  <- t_days <= 0
-  R  <- t_days >= 0
-  BL <- limb_basis(t_days[L], deg)
-  BR <- limb_basis(t_days[R], deg)
-  logY <- log(Yt)
-  aL <- crossprod(BL, logY[L, , drop = FALSE])   # least squares (orthonormal basis)
-  aR <- crossprod(BR, logY[R, , drop = FALSE])
-  Hhat <- matrix(NA_real_, nrow(Yt), ncol(Yt))
-  Hhat[L, ] <- exp(BL %*% aL)
-  Hhat[R, ] <- exp(BR %*% aR)
-  list(coefs = t(rbind(aL, aR)),                 # n x (2 * deg)
-       Hhat  = Hhat,
-       BL = BL, BR = BR)
-}
-
-# ---- Choose the degree: reconstruction error vs number of coefficients --------
-degs <- 1:10
+degs <- 1:20
 deg_table <- data.frame(
-  deg               = degs,
-  global_n_coefs    = degs + 1,
-  global_rmse       = sapply(degs, function(d) median(rmse(Yt, fit_global(d)$Hhat))),
-  global_peak_value = sapply(degs, function(d) median(fit_global(d)$Hhat[t_days == 0, ])),
-  limbs_n_coefs     = 2 * degs,
-  limbs_rmse        = sapply(degs, function(d) median(rmse(Yt, fit_limbs(d)$Hhat)))
+  deg          = degs,
+  n_coefs      = degs + 1,
+  median_rmse  = sapply(degs, function(d) median(rmse(Yt, fit_global(d)$Hhat))),
+  median_peak  = sapply(degs, function(d) median(fit_global(d)$Hhat[t_days == 0, ])),
+  pct_negative = sapply(degs, function(d) 100 * mean(fit_global(d)$Hhat < 0))
 )
 print(round(deg_table, 3))
-# global_peak_value should be ~1; a global polynomial usually can't reach the peak.
 
-plot(deg_table$global_n_coefs, deg_table$global_rmse, type = "b", log = "y",
-     ylim = range(deg_table[, c("global_rmse", "limbs_rmse")]),
-     xlab = "Number of shape coefficients", ylab = "Median reconstruction RMSE (normalised)")
-lines(deg_table$limbs_n_coefs, deg_table$limbs_rmse, type = "b", pch = 2)
-legend("topright", c("Global polynomial", "Two-limb log polynomial"), pch = c(1, 2), lty = 1)
+deg <- 4                                   # from the table
+g   <- fit_global(deg)
+B_global <- cbind(1, poly(t_days, deg))    # the design matrix lm() used
 
-# ---- Fit the chosen model ------------------------------------------------------
-deg   <- 3                                  # set from the table/plot above (elbow)
-fit   <- fit_limbs(deg)
-coefs <- fit$coefs                          # n x 2*deg: the data for the joint distribution
-Hhat  <- fit$Hhat                           # K x n fitted hydrographs
+C <- g$coefs
+colnames(C) <- c("intercept", paste0("poly_", 1:deg))
 
-# ---- Check: real vs fitted for a few events ------------------------------------
-par(mfrow = c(2, 2))
-for (i in sample(ncol(Yt), 4)) {
-  matplot(t_days, cbind(Yt[, i], Hhat[, i], fit_global(8)$Hhat[, i]), type = "l",
-          lty = c(1, 1, 2), col = c("black", "red", "grey50"),
+rebuild <- function(Bm) B_global %*% t(matrix(Bm, ncol = ncol(C)))   # S x p -> K x S
+
+max(abs(rebuild(C) - g$Hhat))              # should be ~0: rebuild reproduces the fits
+
+mu  <- colMeans(C)
+sdv <- apply(C, 2, sd)
+par(mfrow = c(1, 3))
+for (j in 2:4) {
+  lo <- mu; lo[j] <- mu[j] - 2 * sdv[j]
+  hi <- mu; hi[j] <- mu[j] + 2 * sdv[j]
+  matplot(t_days, cbind(rebuild(mu), rebuild(lo), rebuild(hi)), type = "l",
+          lty = c(1, 2, 2), col = c("black", "blue", "red"),
           xlab = "Days from peak", ylab = "Flow / peak flow",
-          main = format(events_p2$Timestamp[i], "%d %b %Y"))
+          main = paste(colnames(C)[j], ": mean ± 2 SD"))
 }
-legend("topright", c("Observed", "Two-limb fit", "Global deg 8"),
-       col = c("black", "red", "grey50"), lty = c(1, 1, 2), cex = 0.8)
 par(mfrow = c(1, 1))
-
-# ---- Simulating a new hydrograph from coefficients (for later) -----------------
-# Given a coefficient vector b (length 2*deg), e.g. drawn from the fitted joint
-# distribution:
-#   s <- numeric(length(t_days))
-#   s[t_days <= 0] <- exp(fit$BL %*% b[1:deg])
-#   s[t_days >= 0] <- exp(fit$BR %*% b[(deg + 1):(2 * deg)])
-#   Q <- Qpeak * s                     # try normalising by peak?
-
 ```
 
 
-```{r linear fit}
+```{r diagnostics}
+# ---- Diagnostics for the shape coefficients --------------------------------
+logQ <- log(events_p2$max_flow)
+n <- nrow(C); p <- ncol(C)
+cat(sprintf("n = %d events, p = %d coefficients, full MVN has %d parameters\n",
+            n, p, p + p * (p + 1) / 2))
+
+# 1. Pairs plot, points coloured by peak size (dark = larger flood)
+cols <- gray(1 - rank(logQ) / (n + 1))
+pairs(C, pch = 21, bg = cols, cex = 1.2,
+      main = "Shape coefficients (darker = larger peak)")
+
+# 2. Marginal QQ plots, one per coefficient, with Shapiro-Wilk p-value
+par(mfrow = c(2, ceiling(p / 2)))
+for (j in 1:p) {
+  qqnorm(C[, j], main = sprintf("%s  (SW p = %.2f)", colnames(C)[j],
+                                shapiro.test(C[, j])$p.value))
+  qqline(C[, j])
+}
+par(mfrow = c(1, 1))
+
+# 3. Joint normality: squared Mahalanobis distances vs chi-squared quantiles
+d2 <- mahalanobis(C, colMeans(C), cov(C))
+qq <- qqplot(qchisq(ppoints(n), df = p), sort(d2),
+             xlab = bquote(chi[.(p)]^2 ~ "quantiles"),
+             ylab = "Squared Mahalanobis distance",
+             main = "Multivariate normality check")
+abline(0, 1)
+
+
+# 4. Correlations between coefficients (does dependence matter?)
+print(round(cor(C), 2))
+
+# 5. Does shape depend on flood size? Spearman correlation with log peak
+dep <- t(sapply(1:p, function(j) {
+  ct <- cor.test(C[, j], logQ, method = "spearman", exact = FALSE)
+  c(rho = unname(ct$estimate), p_value = ct$p.value)
+}))
+rownames(dep) <- colnames(C)
+print(round(dep, 3))
 
 ```
 
