@@ -790,6 +790,62 @@ fig("fig7_energy_scores", 7, 4.5, boxplot(ES, names = short_names, outline = FAL
     ylab = "Energy score per held-out event (lower = better)",
     main = "Leave-one-event-out energy score"))
 
+#Figure 8: method comparison (envelopes near the peak + coverage by time)
+set.seed(11)
+
+# Leave-one-event-out coverage of the 90% band at each hour (takes ~1 minute)
+cov90_t <- sapply(seq_len(nrow(methods)), function(j) {
+  hit <- matrix(0, n_ev, nt)
+  for (i in seq_len(n_ev)) {
+    md <- fit_model(Y_pca[-i, , drop = FALSE], methods$rep[j], methods$dist[j],
+                    methods$k[j], methods$log[j])
+    S  <- sim_shapes(md, cfg$m_sim);  y <- Y_pca[i, ]
+    q  <- apply(S, 2, quantile, c(.05, .95))
+    hit[i, ] <- y >= q[1, ] & y <= q[2, ]
+  }
+  colMeans(hit)
+})
+colnames(cov90_t) <- c("Fixed", "PCA", "Poly4", "Poly7")
+
+# Full-data fits, 2000 simulated shapes each (PCA, poly d=4, poly d=7)
+sims <- lapply(2:4, function(j) {
+  m <- fit_model(Y_pca, methods$rep[j], methods$dist[j], methods$k[j], methods$log[j])
+  sim_shapes(m, 2000)
+})
+qs  <- lapply(sims, function(S) apply(S, 2, quantile, c(.05, .5, .95)))
+obs <- apply(Y_pca, 2, quantile, c(.05, .5, .95))
+
+fig("fig8_method_comparison", 11, 4.5, {
+par(mfrow = c(1, 2), mar = c(4.2, 4.2, 2.5, 1))
+w  <- abs(t_h) <= 24
+cl <- c("red", "blue", "darkgreen")
+
+plot(t_h[w], obs[2, w], type = "n", ylim = c(0.2, 1.15), xlab = "Hours from peak",
+     ylab = "Q / Qpeak", main = "Simulated 5/50/95% envelopes near the peak")
+polygon(c(t_h[w], rev(t_h[w])), c(obs[1, w], rev(obs[3, w])), col = adjustcolor("grey", .5), border = NA)
+lines(t_h[w], obs[2, w], lwd = 2)
+for (k in 1:3) {
+  matlines(t_h[w], t(qs[[k]][c(1, 3), w]), lty = 2, col = cl[k], lwd = 1.5)
+  lines(t_h[w], qs[[k]][2, w], col = cl[k], lwd = 2)
+}
+abline(h = 1, lty = 3)
+legend("bottomright", c("observed (5-95%)", "PCA k=4", "Polynomial d=4", "Polynomial d=7"),
+       col = c("grey50", cl), lwd = c(6, 2, 2, 2), bty = "n", cex = .8)
+
+matplot(t_h, cov90_t, type = "l", lty = 1, lwd = 2, col = c("black", "red", "blue", "darkgreen"),
+        ylim = c(0, 1), xlab = "Hours from peak", ylab = "Observed coverage of 90% band",
+        main = "Leave-one-event-out coverage by time")
+abline(h = .9, lty = 2)
+legend("left", c("Fixed shape", "PCA k=4", "Polynomial d=4", "Polynomial d=7"),
+       col = c("black", "red", "blue", "darkgreen"), lwd = 2, bty = "n", cex = .8)
+par(mfrow = c(1, 1))
+})
+
+# Numbers quoted in the write-up
+print(round(colMeans(cov90_t), 3))                                    # coverage over the window
+print(round(colMeans(cov90_t[abs(t_h) <= 6, ]), 3))                   # coverage within 6 h of the peak
+print(round(sapply(qs, function(q) q[c(2, 3), ctr]), 3))              # median / 95th pct value at the peak
+
 ```
 
 ## Emma C
