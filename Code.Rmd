@@ -491,7 +491,7 @@ legend("topright", legend = c("Original", "Recon"), col = c("black", "red"), lty
 
 ```{r harry_settings}
 
-cfg <- list(k_pc = 8,        # number of parameters (PCs) kept; 8 = 95% of variance here
+cfg <- list(k_pc = 4,        # number of parameters (PCs) kept; 8 = 95% of variance here
             use_log = TRUE,  # TRUE = model log(shape): keeps simulated flows positive (recommended)
             m_sim = 100,     # simulated hydrographs per held-out event in cross-validation
             n_boot = 200,    # bootstrap resamples for the PCA stability check
@@ -620,6 +620,16 @@ cum_pve <- cumsum(pca_s$sdev^2) / sum(pca_s$sdev^2)
 cat("\nLeave-one-out reconstruction RMSE (Q/Qpeak) at the same number of parameters\n"); print(round(rec_tab, 4))
 cat("PCs for 90% / 95% of variance:", which(cum_pve >= .9)[1], "/", which(cum_pve >= .95)[1],
     "| chosen k_pc =", cfg$k_pc, "\n")
+
+#Table for the report, analogous to the polynomial degree table (in-sample fit of the observed shapes)
+sel_tab <- t(sapply(1:8, function(kk) {
+  A   <- pca_s$rotation[, 1:kk, drop = FALSE]
+  Xs  <- to_scale(Y)                                              # same data the PCA was fitted to
+  fit <- from_scale(sweep(sweep(Xs, 2, pca_s$center) %*% A %*% t(A), 2, pca_s$center, "+"))
+  c(Components = kk, CumVar_pct = 100 * cum_pve[kk], MedianRMSE = median(sqrt(rowMeans((Y - fit)^2))),
+    MedianFittedPeak = median(fit[, ctr]), PctNegative = 100 * mean(fit < 0))
+}))
+cat("\nPCA component-number table (compare with the polynomial degree table)\n"); print(round(sel_tab, 3))
 
 fig("fig2_choose_k", 9, 4.2, {
 par(mfrow = c(1, 2))
