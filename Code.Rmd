@@ -624,9 +624,9 @@ cat("PCs for 90% / 95% of variance:", which(cum_pve >= .9)[1], "/", which(cum_pv
 #Table for the report, analogous to the polynomial degree table (in-sample fit of the observed shapes)
 sel_tab <- t(sapply(1:8, function(kk) {
   A   <- pca_s$rotation[, 1:kk, drop = FALSE]
-  Xs  <- to_scale(Y)                                              # same data the PCA was fitted to
+  Xs  <- to_scale(Y_pca)                                              # same data the PCA was fitted to
   fit <- from_scale(sweep(sweep(Xs, 2, pca_s$center) %*% A %*% t(A), 2, pca_s$center, "+"))
-  c(Components = kk, CumVar_pct = 100 * cum_pve[kk], MedianRMSE = median(sqrt(rowMeans((Y - fit)^2))),
+  c(Components = kk, CumVar_pct = 100 * cum_pve[kk], MedianRMSE = median(sqrt(rowMeans((Y_pca - fit)^2))),
     MedianFittedPeak = median(fit[, ctr]), PctNegative = 100 * mean(fit < 0))
 }))
 cat("\nPCA component-number table (compare with the polynomial degree table)\n"); print(round(sel_tab, 3))
@@ -772,11 +772,11 @@ m_pca <- fit_model(Y_pca, "pca", "mvn", cfg$k_pc, cfg$use_log);  m_fix <- fit_mo
 sim_pca <- sim_shapes(m_pca, n_ev)
 fig("fig6_sim_vs_obs", 11, 4.5, {
 par(mfrow = c(1, 3))
-matplot(t_h, t(Y), type = "l", lty = 1, col = adjustcolor("grey30", .3), ylim = c(0, 1.5),
+matplot(t_h, t(Y_pca), type = "l", lty = 1, col = adjustcolor("grey30", .3), ylim = c(0, 1.5),
         main = "Observed shapes", xlab = "Hours from peak", ylab = "Q / Qpeak")
 matplot(t_h, t(sim_pca), type = "l", lty = 1, col = adjustcolor("red", .3), ylim = c(0, 1.5),
         main = "PCA simulated shapes", xlab = "Hours from peak", ylab = "Q / Qpeak")
-matplot(t_h, cbind(t(apply(Y, 2, quantile, c(.05, .5, .95))), t(apply(sim_pca, 2, quantile, c(.05, .5, .95))), m_fix$mu),
+matplot(t_h, cbind(t(apply(Y_pca, 2, quantile, c(.05, .5, .95))), t(apply(sim_pca, 2, quantile, c(.05, .5, .95))), m_fix$mu),
         type = "l", lty = c(2, 1, 2, 2, 1, 2, 1), col = c(rep("black", 3), rep("red", 3), "blue"), lwd = c(1, 2, 1, 1, 2, 1, 2),
         ylim = c(0, 1.2), main = "5/50/95% envelopes", xlab = "Hours from peak", ylab = "Q / Qpeak")
 legend("topright", c("observed", "PCA simulated", "fixed (SEPA)"), col = c("black", "red", "blue"), lty = 1, bty = "n", cex = .7)
@@ -805,21 +805,7 @@ nrow(cand)
 nrow(peaks_passed)
 
 # Check the number of hydrographs used in PCA
-nrow(Y)
-
-# Calculate duration of each extracted event (hours)
-duration <- (peaks_passed$peak_end -
-             peaks_passed$peak_begin) / 4
-
-# Summary statistics
-summary(duration)
-
-# Distribution of event durations
-hist(duration,
-     breaks = 30,
-     main = "Distribution of extracted event durations",
-     xlab = "Duration (hours)",
-     col = "lightblue")
+nrow(Y_pca)
 
 ```
 ```{r checks2}
@@ -839,13 +825,6 @@ plot(pit$Timestamp[lo:hi], flow[lo:hi],
      xlab = "Time",
      ylab = "Flow (m3/s)",
      main = "Flood hydrograph with extracted boundaries")
-
-# Add boundaries from findpeaks()
-abline(v = pit$Timestamp[start], col = "blue", lty = 2)
-abline(v = pit$Timestamp[end], col = "red", lty = 2)
-
-# Mark the maximum
-abline(v = pit$Timestamp[peak], col = "darkgreen", lty = 2)
 
 legend("topright",
        legend = c("Flow", "Start", "End", "Peak"),
@@ -871,7 +850,7 @@ c(
 )
 
 # Maximum normalised flow in each PCA hydrograph
-max_flow <- apply(Y, 1, max)
+max_flow <- apply(Y_pca, 1, max)
 
 # Summarise the maximum values
 summary(max_flow)
@@ -881,13 +860,13 @@ sum(max_flow > 1.05)
 ``` 
 ```{r checks3}
 # Identify hydrographs retained for PCA
-valid <- which(!sapply(segs, is.null))
+valid <- seq_len(nrow(Y_pca))
 
 # Find maximum normalised flow for each hydrograph
-max_ratio <- apply(Y, 1, max)
+max_ratio <- apply(Y_pca, 1, max)
 
 # Find the time of the largest peak in each window
-max_hour <- t_h[max.col(Y, ties.method = "first")]
+max_hour  <- t_h[max.col(Y_pca, ties.method = "first")]
 
 # Create table of potentially problematic events
 problem_events <- tibble(
