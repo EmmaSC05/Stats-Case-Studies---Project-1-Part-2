@@ -7,6 +7,8 @@ output:
   html_document: default
 ---
 
+## Packages and Data
+
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 library(tidyverse)
@@ -20,7 +22,7 @@ library(pracma)
 library(ismev)
 ```
 
-```{r import data, include=FALSE}
+```{r load data, include=FALSE}
 # Import Pitnacree flow data directly from ZIP file in Github
 pitnacree <- read.csv(unz("pitnacree.zip", "pitnacree.csv"))
 
@@ -33,12 +35,11 @@ raw <- pitnacree$Timestamp
 ```
 
 
-### Importing Peaks ###
-```{r peaks}
-threshold     <- 260  # Peaks over threshold (m3/s), change for initial threshold
+```{r prepare data}
+threshold     <- 260  # Peaks-flow threshold (m3/s)
 steps_per_day <- 96   # 15-minute data resolution (24 * 4)
 
-# Put Pitnacree on a continuous 15-minute grid
+# Make a full 15-minute time grid to check for missing observations
 pit <- tibble(
   Timestamp = seq(
     min(pitnacree$Timestamp, na.rm= TRUE),
@@ -52,88 +53,21 @@ pit <- tibble(
   )
 
 flow <- pit$Value
-flow_noNA <- replace_na(flow, 0) # 0 ensures peak detection ignores missing intervals
+flow_noNA <- replace_na(flow, 0) # 0 ensures peak detection ignores missing intervals, missing values cannot count as peaks
 
-
-# Extract candidate peaks exceeding the specified threshold
-raw <- findpeaks(flow_noNA, minpeakheight = threshold, minpeakdistance = 1, zero = "0")
-
-cand <- tibble(
-  max_flow   = raw[, 1],
-  max_time   = raw[, 2],
-  peak_begin = raw[, 3],
-  peak_end   = raw[, 4]
-) %>%
-  arrange(max_time) %>%
-  mutate(ttr = max_time - peak_begin) # Time to rise in 15-min steps
-
-
-# Compute average time to peak from "clean" isolated events
-near_other <- sapply(seq_len(nrow(cand)), function(i) {
-  any(abs(cand$max_time[-i] - cand$max_time[i]) < 7 * steps_per_day)
-})
-
-clean <- cand %>%
-  mutate(clean = flow[peak_begin] < 0.5 * max_flow & !near_other & !is.na(flow[peak_begin]))
-
-avg_ttr <- mean(clean$ttr[clean$clean])
-min_sep <- 3 * avg_ttr
-cat(sprintf("Avg time to peak: %.2f hours | Min FEH separation: %.2f hours\n", avg_ttr / 4, min_sep / 4))
-
-
-# Filter candidate peaks using FEH independence criteria 
-keep <- rep(TRUE, nrow(cand))
-last <- 1
-
-for (k in 2:nrow(cand)) {
-  sep <- cand$max_time[k] - cand$max_time[last]
-  independent <- sep >= min_sep
-  
-  if (independent) {
-    trough <- min(flow[cand$max_time[last]:cand$max_time[k]], na.rm = TRUE)
-    independent <- trough < (2/3) * cand$max_flow[last]
-  }
-  
-  if (independent) {
-    last <- k
-  } else if (cand$max_flow[k] > cand$max_flow[last]) {
-    keep[last] <- FALSE
-    last <- k
-  } else {
-    keep[k] <- FALSE
-  }
-}
-
-peaks_passed <- cand[keep, ]
-n_years <- sum(!is.na(flow)) / (steps_per_day * 365.25)
+# Check the input data before extracting events.
+cat("Missing timestamps:", sum(is.na(pitnacree$Timestamp)), "\n")
+cat("Duplicate timestamps:", sum(duplicated(pitnacree$Timestamp)), "\n")
+cat("Missing discharge values on the full grid:", sum(is.na(pit$Value)), "\n")
 ```
 
-```{r find peaks UPDATED}
-threshold     <- 260  # Peaks over threshold (m3/s), change for initial threshold
-steps_per_day <- 96   # 15-minute data resolution (24 * 4)
+## Selecting High Flow Peaks
 
-# Put Pitnacree on a continuous 15-minute grid
-pit <- tibble(
-  Timestamp = seq(
-    min(pitnacree$Timestamp, na.rm= TRUE),
-    max(pitnacree$Timestamp, na.rm=TRUE),
-    by = "15 min"
-  )
-) %>%
-  left_join(
-    pitnacree %>% dplyr::select(Timestamp, Value),
-    by = "Timestamp"
-  )
+```{r Select peaks}
 
-flow <- pit$Value
-flow_noNA <- replace_na(flow, 0) # 0 ensures peak detection ignores missing intervals
-
-
-# Extract candidate peaks exceeding the specified threshold
-# CHANGED: peakpat allows a flat top (repeated values at the peak); the default
-# pattern skips any peak whose maximum value repeats.
-raw <- findpeaks(flow_noNA, minpeakheight = threshold,
-                 peakpat = "[+]{1,}[0]*[-]{1,}")
+# find candidate peaks above the threshold
+# Allows repeated observations at the peak (flat topped events)
+raw <- findpeaks(flow_noNA, minpeakheight = threshold, peakpat = "[+]{1,}[0]*[-]{1,}")
 
 cand <- tibble(
   max_flow   = raw[, 1],
@@ -141,10 +75,7 @@ cand <- tibble(
 ) %>%
   arrange(max_time)
 
-# CHANGED: robust start of rise. findpeaks' own start point is reset by any
-# small dip or flat step on the rising limb. Instead, start of rise = last time
-# in the 5 days before the peak when flow was within 10% (of the rise) of the
-# lowest flow in that window.
+# Find where the rise started, allowing for small changes in flow
 lookback <- 5 * steps_per_day
 rise_tol <- 0.10
 
@@ -159,9 +90,8 @@ cand <- cand %>%
   mutate(ttr = max_time - peak_begin) # Time to rise in 15-min steps
 
 
-# Compute average time to peak from "clean" isolated events
-# CHANGED: isolation is judged against one peak per flood (the largest within
-# +/- 3 days), so a flood's own small wiggles don't make it look "non-isolated".
+# Estimate the average rise time from isolated, well defined events
+# Use dominant peaks to avoid counting small fluctuations as separate events
 dominant <- sapply(cand$max_time, function(tp) {
   w <- max(1, tp - 3 * steps_per_day):min(length(flow), tp + 3 * steps_per_day)
   flow[tp] >= max(flow[w], na.rm = TRUE)
@@ -175,7 +105,7 @@ near_other <- sapply(cand$max_time, function(tp) {
 clean <- cand %>%
   mutate(clean = dominant & flow[peak_begin] < 0.5 * max_flow & !near_other &
                  !is.na(flow[peak_begin]) &
-                 peak_begin > max_time - lookback)  # CHANGED: rise start not at window edge
+                 peak_begin > max_time - lookback) # exclude rises starting at the window boundary  
 
 avg_ttr <- mean(clean$ttr[clean$clean])
 min_sep <- 3 * avg_ttr
@@ -183,7 +113,7 @@ cat(sprintf("Clean events: %d | Avg time to peak: %.2f hours | Min FEH separatio
             sum(clean$clean), avg_ttr / 4, min_sep / 4))
 
 
-# Filter candidate peaks using FEH independence criteria (unchanged)
+# Apply the time separation and intervening trough criteria
 keep <- rep(TRUE, nrow(cand))
 last <- 1
 
@@ -209,12 +139,16 @@ for (k in seq_len(nrow(cand))[-1]) {
 peaks_passed <- cand[keep, ]
 n_years <- sum(!is.na(flow)) / (steps_per_day * 365.25)
 
+```
 
-# ---- NEW: hydrograph extraction for part 2 ---------------------------------
-# Fixed window either side of each peak, aligned at the peak (offset 0).
-# Events whose window runs off the record or contains missing data are dropped.
-hydro_halfw <- 3 * steps_per_day   # +/- 10 days; set to match your part 2 window
-thin        <- 4                    # keep every 4th point (hourly); 1 = all 15-min points
+
+## Extracting and Normalising Hydrographs
+
+```{r make hydrographs}
+
+# Take a fixed window around each peak and discard incomplete windows
+hydro_halfw <- 3 * steps_per_day   # 3 days on each side
+thin        <- 4                    # keep one observation each hour
 
 offsets <- seq(-hydro_halfw, hydro_halfw, by = thin)
 
@@ -222,8 +156,7 @@ peaks_passed <- peaks_passed %>%
   mutate(
     Timestamp      = pit$Timestamp[max_time],
     ttr_hours      = ttr / 4,
-    # Duration = hours of the continuous stretch around the peak with flow
-    # above half the peak (a neighbouring flood can't inflate it)
+    # Only use windows fully covered by the discharge record.
     halfwidth_hours = sapply(max_time, function(tp) {
       below <- which(flow < 0.5 * flow[tp])
       start <- max(c(0, below[below < tp])) + 1
@@ -237,8 +170,7 @@ peaks_passed <- peaks_passed %>%
                         w <- max(1, tp - hydro_halfw):min(length(flow), tp + hydro_halfw)
                         !anyNA(flow[w])
                       }),
-    # No larger flood inside the window (otherwise the normalised shape
-    # exceeds 1 away from the peak and mixes two events)
+    # Make sure the selected peak is the highest flow in the window
     peak_is_window_max = sapply(max_time, function(tp) {
       w <- max(1, tp - hydro_halfw):min(length(flow), tp + hydro_halfw)
       max(flow[w], na.rm = TRUE) <= flow[tp]
@@ -247,10 +179,10 @@ peaks_passed <- peaks_passed %>%
 
 events_p2 <- peaks_passed %>% filter(complete_window, peak_is_window_max)
 
-# Hydrograph matrix: one row per event, one column per time offset
-Q_raw <- t(sapply(events_p2$max_time, function(tp) flow[tp + offsets]))   # m3/s
-Y_shape     <- Q_raw / events_p2$max_flow                                       # normalised: peak = 1
-t_days <- offsets / steps_per_day                                         # time from peak (days)
+# Hydrograph matrix: Rows are events, Columns are hours relative to the peak
+Q_raw <- t(sapply(events_p2$max_time, function(tp) flow[tp + offsets]))   
+Y_shape <- Q_raw / events_p2$max_flow                             # peak flow scaled to 1  
+t_days <- offsets / steps_per_day                                         
 
 cat(sprintf(paste0("Independent events: %d over %.1f years\n",
                    "Dropped for part 2: %d incomplete window, %d larger flood within +/-%g days\n",
@@ -262,18 +194,216 @@ cat(sprintf(paste0("Independent events: %d over %.1f years\n",
 
 ```
 
-
-```{r peaks_empty}
-
-```
-
 ```{r}
 
 matplot(t_days, t(Y_shape), type = "l", lty = 1, col = rgb(0, 0, 0, 0.3),
         xlab = "Days from peak", ylab = "Flow / peak flow")   # spaghetti plot
 ```
 
-## Emma D
+
+## Data Validation and Hydrograph Window Selection
+
+### Data quality and peak extraction checks
+
+We first check the completeness of the recorded flow data and summarise the number of peaks retained after applying the independence criteria.
+
+```{r emma data checks}
+
+# Check for missing or duplicated observations
+cat("Missing timestamps:", sum(is.na(pitnacree$Timestamp)), "\n")
+cat("Duplicate timestamps:", sum(duplicated(pitnacree$Timestamp)), "\n")
+cat("Missing flow values:", sum(is.na(pitnacree$Value)), "\n")
+cat("Missing values on 15-minute grid:", sum(is.na(pit$Value)), "\n")
+
+# Check event selection
+cat("Candidate peaks:", nrow(cand), "\n")
+cat("Independent peaks:", nrow(peaks_passed), "\n")
+cat("Hydrographs retained for modelling:", nrow(events_p2), "\n")
+
+```
+
+These checks assess the completeness of the flow record and show how many events survive the extraction. They dont independently establish the accuracy of the recorded discharge values.
+
+### Distribution of half-peak widths
+
+```{r halfpeak widths}
+
+# Extract the half-peak widths
+width_hours <- peaks_passed$halfwidth_hours
+
+# Summary statistics
+summary(width_hours)
+
+# Count unusually long high-flow periods
+cat("Widths above 144 hours:",
+    sum(width_hours > 144, na.rm = TRUE), "\n")
+
+cat("Widths above 480 hours:",
+    sum(width_hours > 480, na.rm = TRUE), "\n")
+
+# Visualise the distribution
+hist(width_hours,
+     breaks = 30,
+     main = "Distribution of Half-Peak Widths",
+     xlab = "Half-peak width (hours)",
+     col = "purple")
+
+```
+
+Half-peak widths indicate the length of the continuous period surrounding each selected peak during which discharge remains above half its peak value. Unusually long widths may reflect sustained high flows or neighbouring flood activity, rather than a single isolated flood.
+
+### Validate the hydrographs retained for modelling
+
+Some extracted windows were found to have discharge values exceeding their selected independent peak. The final extraction procedure excludes such windows, as well as incomplete windows. We check that this filtering has worked.
+
+```{r hydrograph validation}
+
+# Confirm that all retained windows satisfy the selection rules
+stopifnot(
+  all(events_p2$complete_window),
+  all(events_p2$peak_is_window_max),
+  nrow(Y_shape) == nrow(events_p2),
+  !anyNA(Y_shape),
+  all(apply(Y_shape, 1, max) <= 1 + 1e-8)
+)
+
+cat("All retained hydrographs passed validation.\n")
+cat("Final number of hydrographs:", nrow(Y_shape), "\n")
+
+```
+
+This confirms that the retained modelling hydrographs are complete and that their selected peaks are the maximum discharge within their extraction windows. This avoids the normalisation issue identified during the initial investigation.
+
+### Comparing hydrograph window lengths
+
+We compare alternative extraction windows to assess the trade-off between retaining the relevant high-flow period and avoiding larger neighbouring peaks.
+
+Two criteria are considered:
+1. The selected peak must be the maximum discharge in the window.
+2. Discharge must fall below 50% of the selected peak on both sides.
+
+We also examine whether discharge falls below 25% on both sides, as an additional indication of how much of the lower-flow portions are represented.
+
+```{r window comparison}
+
+# Candidate half-window lengths, in hours
+window_hours <- c(24, 36, 48, 72, 120, 240)
+
+# Use the original 15-minute flow grid
+flow <- pit$Value
+peak_indices <- peaks_passed$max_time
+
+window_results <- purrr::map_dfr(window_hours, function(h) {
+
+  purrr::map_dfr(seq_along(peak_indices), function(i) {
+
+    peak <- peak_indices[i]
+
+    # Four observations per hour
+    n <- h * 4
+    lo <- peak - n
+    hi <- peak + n
+
+    # Exclude windows outside the record or containing missing data
+    if (lo < 1 || hi > length(flow) ||
+        anyNA(flow[lo:hi])) {
+
+      return(tibble(
+        Window_hours = h,
+        Complete = FALSE,
+        Larger_peak = NA,
+        Halfpeak_captured = NA,
+        Below_25_both = NA,
+        Left_boundary = NA_real_,
+        Right_boundary = NA_real_
+      ))
+    }
+
+    # Extract the observed hydrograph
+    seg <- flow[lo:hi]
+    selected_peak <- flow[peak]
+
+    # Separate the rising and falling sides
+    left <- seg[1:n]
+    right <- seg[(n + 2):length(seg)]
+
+    tibble(
+      Window_hours = h,
+      Complete = TRUE,
+
+      # Does the window contain a larger neighbouring discharge?
+      Larger_peak =
+        max(seg) > selected_peak * (1 + 1e-8),
+
+      # Is there a below-half-peak observation on both sides?
+      Halfpeak_captured =
+        any(left < 0.5 * selected_peak) &&
+        any(right < 0.5 * selected_peak),
+
+      # Are lower-flow portions also observed on both sides?
+      Below_25_both =
+        any(left < 0.25 * selected_peak) &&
+        any(right < 0.25 * selected_peak),
+
+      # Discharge at each boundary, relative to the selected peak
+      Left_boundary = seg[1] / selected_peak,
+      Right_boundary = tail(seg, 1) / selected_peak
+    )
+  })
+})
+
+# Summarise the results
+window_comparison <- window_results %>%
+  group_by(Window_hours) %>%
+  summarise(
+    Complete_windows = sum(Complete),
+
+    N_larger_peak = sum(Larger_peak, na.rm = TRUE),
+
+    N_halfpeak_captured =
+      sum(Halfpeak_captured, na.rm = TRUE),
+
+    # Both main criteria must hold
+    N_suitable = sum(
+      Complete & !Larger_peak & Halfpeak_captured,
+      na.rm = TRUE
+    ),
+
+    # Among windows with the selected peak as maximum
+    # assess the wider lower-flow behaviour
+    Pct_below_25 = round(
+      100 * sum(Complete & !Larger_peak & Below_25_both,
+                na.rm = TRUE) /
+        sum(Complete & !Larger_peak, na.rm = TRUE),
+      1
+    ),
+
+    Median_left_boundary = round(
+      median(Left_boundary[Complete & !Larger_peak],
+             na.rm = TRUE), 3
+    ),
+
+    Median_right_boundary = round(
+      median(Right_boundary[Complete & !Larger_peak],
+             na.rm = TRUE), 3
+    ),
+
+    .groups = "drop"
+  )
+
+print(window_comparison, width = Inf)
+
+```
+
+The window comparison examines the trade-off between representing the high-flow period and excluding larger neighbouring peaks. Short windows can truncate the high-flow period, while longer windows are increasingly likely to contain neighbouring flood activity.
+
+The 25% threshold and boundary discharge ratios provide additional information about the rising and recession limbs. However, these are diagnostic measures rather than guarantees that the full flood hydrograph has been captured, since background discharge may remain elevated.
+
+These results can inform the choice of a common window for PCA and polynomial modelling. The final selection should also account for model performance and the intended hydrological application.
+
+
+
+## polynomial
 
 
 ```{r scale peaks to same grid, show what each coefficient represents}
@@ -374,14 +504,15 @@ print(round(dep, 3))
 ```
 
 ```{r MVN simulation, spaghetti plots}
+install.packages("mvtnorm")
 library(mvtnorm)
 set.seed(2026)
 
-# ---- Fit the MVN to all events ------------------------------------------------
+# Fit the MVN to all events 
 mu    <- colMeans(C)
 Sigma <- cov(C)
 
-# ---- Simulate shapes ------------------------------------------------------------
+# Simulate shapes 
 S     <- 1000
 C_sim <- rmvnorm(S, mu, Sigma)          # S x p simulated coefficient vectors
 Y_sim <- rebuild(C_sim)                 # K x S simulated normalised hydrographs
@@ -389,7 +520,7 @@ Y_sim <- rebuild(C_sim)                 # K x S simulated normalised hydrographs
 # Reference: the observed curves' own polynomial fits (same smoothness as simulations)
 Y_fit <- rebuild(C)                     # K x n
 
-# ---- 1. Observed vs simulated spaghetti plots -----------------------------------
+# Observed vs simulated spaghetti plots
 par(mfrow = c(1, 3))
 ylims <- range(Y_shape, Y_fit, Y_sim[, 1:100])
 matplot(t_days, t(Y_shape), type = "l", lty = 1, col = rgb(0, 0, 0, 0.15),
@@ -400,7 +531,8 @@ matplot(t_days, Y_sim[, 1:100], type = "l", lty = 1, col = rgb(1, 0, 0, 0.15),
         ylim = ylims, main = "Simulated (100 of 1000)", xlab = "Days from peak", ylab = "")
 par(mfrow = c(1, 1))
 
-# ---- 2. Do the simulated bands match the fitted bands? ------------------------
+
+# Do the simulated bands match the fitted bands?
 band <- function(Y) apply(Y, 1, quantile, c(0.05, 0.5, 0.95))   # Y is K x m
 b_fit <- band(Y_fit); b_sim <- band(Y_sim)
 matplot(t_days, t(b_fit), type = "l", lty = c(2, 1, 2), col = "blue", lwd = 2,
@@ -408,7 +540,7 @@ matplot(t_days, t(b_fit), type = "l", lty = c(2, 1, 2), col = "blue", lwd = 2,
         main = "Median and 90% bands: fitted observed (blue) vs simulated (red)")
 matlines(t_days, t(b_sim), lty = c(2, 1, 2), col = "red", lwd = 2)
 
-# ---- 3. Plausibility of simulated hydrographs --------------------------------
+# Plausibility of simulated hydrographs 
 at_peak   <- Y_sim[t_days == 0, ]
 max_where <- t_days[apply(Y_sim, 2, which.max)]
 plaus <- c(
@@ -419,7 +551,8 @@ plaus <- c(
 )
 round(plaus, 2)
 
-# ---- 4. Hydrological features: simulated vs fitted observed -------------------
+
+# Hydrological features: simulated vs fitted observed 
 dt <- diff(t_days)[1]
 feat_of <- function(Y) data.frame(volume    = colSums(Y) * dt,
                                   halfwidth = colSums(Y >= 0.5 * apply(Y, 2, max)) * dt)
@@ -434,10 +567,10 @@ for (v in names(f_fit)) {
 par(mfrow = c(1, 1))
 ```
 
-## Harry
+## PCA
 
 
-```{r harry}
+```{r PCA}
 # 1. Hydrograph matrix: one row per event, hourly values from 72h before to 72h after the peak,
 #    divided by the peak flow so each row is a shape
 #pk_idx <- sort(events_p2$max_time)
@@ -455,29 +588,29 @@ par(mfrow = c(1, 1))
 #dim(Y)
 
 
-# 1. Use the shared hydrograph matrix from the peaks chunk
+# Use the shared hydrograph matrix from the peaks chunk
 #    (same events, window and normalisation as Method 1)
 Y_pca <- Y_shape                 # n x K, peak = 1 at t = 0
 t_h   <- t_days * 24             # hours from peak, for plotting
 dim(Y_pca)
 
-# 2. PCA (centre, don't scale: all columns already on the same scale)
+# PCA (centre, don't scale: all columns already on the same scale)
 pca_result <- prcomp(Y_pca, center = TRUE, scale. = FALSE)
 
-# 3. Variance explained
+# Variance explained
 plot(pca_result)
 head(cumsum(pca_result$sdev^2) / sum(pca_result$sdev^2), 10)
 
-# 4. Loadings as a function of time
+# Loadings as a function of time
 plot(t_h, pca_result$rotation[, 1], type = "l", col = "red", ylim = range(pca_result$rotation[, 1:2]),
      xlab = "Hours from peak", ylab = "Loading", main = "Loadings for PC1 and PC2")
 lines(t_h, pca_result$rotation[, 2], col = "blue")
 legend("bottomright", legend = c("PC1", "PC2"), col = c("red", "blue"), lty = 1)
 
-# 5. Scores
+# Scores
 head(pca_result$x[, 1:3])
 
-# 6. Reconstruct hydrograph 1 using k PCs
+#Reconstruct hydrograph 1 using k PCs
 mean_hydro <- colMeans(Y_pca)
 k <- 3
 recon <- mean_hydro + pca_result$x[1, 1:k] %*% t(pca_result$rotation[, 1:k])
@@ -487,7 +620,7 @@ lines(t_h, recon, col = "red", lwd = 2, lty = 2)
 legend("topright", legend = c("Original", "Recon"), col = c("black", "red"), lty = c(1, 2), lwd = 2)
 ```
 
-### 7. SETTINGS AND SHARED OBJECTS  (change tuning choices here only)
+### SETTINGS AND SHARED OBJECTS  (change tuning choices here only!!)
 
 ```{r harry_settings}
 
@@ -532,7 +665,7 @@ shape_features <- function(s) {
 }
 ```
 
-### 8. EXPLORATORY ANALYSIS OF THE SHAPES
+### EXPLORATORY ANALYSIS OF THE SHAPES
 
 ```{r harry_eda}
 
@@ -560,7 +693,7 @@ print(round(sapply(colnames(feat_obs), function(v)
 cat("\nEvents per month:\n"); print(table(month(peak_time)))
 ```
 
-### 9. A GENERIC REPRESENTATION:  x_i(t) ~= mu(t) + sum_j z_ij A_j(t)
+### A GENERIC REPRESENTATION:  x_i(t) ~= mu(t) + sum_j z_ij A_j(t)
 
 ```{r harry_representation}
 #    type = "pca"  : mu = mean shape, A = principal-component loadings
@@ -676,7 +809,7 @@ fig("fig5_pc_stability", 6, 4, boxplot(t(boot_load), names = paste0("PC", 1:4), 
     ylab = "|correlation| with full-data loading", main = "Bootstrap stability of loadings"))
 ```
 
-### 10. Simulating shapes and validating (leave-one-event-out)
+### Simulating shapes and validating (leave-one-event-out)
 
 ```{r harry_validation}
 # rep  : "none" (raw shapes) | "pca" | "poly"
@@ -848,7 +981,7 @@ print(round(sapply(qs, function(q) q[c(2, 3), ctr]), 3))              # median /
 
 ```
 
-## Emma C
+### DATA CHECKS
 
 ```{r checks}
 # Check for missing or duplicate data
